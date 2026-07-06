@@ -101,6 +101,65 @@ func TestRemoveCleanWorktreeRejectsDirtyWorktree(t *testing.T) {
 	}
 }
 
+func TestFetchOnlyUpdatesDefaultBranch(t *testing.T) {
+	base := t.TempDir()
+	originDir := filepath.Join(base, "origin")
+	cloneDir := filepath.Join(base, "clone")
+
+	// Origin repo with two branches: main (default) and feature.
+	mustGit(t, "", "init", "--initial-branch=main", originDir)
+	mustGit(t, originDir, "config", "user.email", "test@test.com")
+	mustGit(t, originDir, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(originDir, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, originDir, "add", ".")
+	mustGit(t, originDir, "commit", "-m", "initial")
+	mustGit(t, originDir, "branch", "feature")
+
+	// Clone it: origin is set with the default all-branches refspec and both
+	// remote-tracking branches exist. origin/HEAD points at main.
+	mustGit(t, "", "clone", originDir, cloneDir)
+	mustGit(t, cloneDir, "config", "user.email", "test@test.com")
+	mustGit(t, cloneDir, "config", "user.name", "Test")
+
+	featureBefore := mustGitOut(t, cloneDir, "rev-parse", "refs/remotes/origin/feature")
+
+	// Advance both branches on origin AFTER the clone.
+	mustGit(t, originDir, "checkout", "feature")
+	if err := os.WriteFile(filepath.Join(originDir, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, originDir, "add", ".")
+	mustGit(t, originDir, "commit", "-m", "feature advance")
+	featureNew := mustGitOut(t, originDir, "rev-parse", "HEAD")
+
+	mustGit(t, originDir, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(originDir, "main.txt"), []byte("main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, originDir, "add", ".")
+	mustGit(t, originDir, "commit", "-m", "main advance")
+	mainNew := mustGitOut(t, originDir, "rev-parse", "HEAD")
+
+	// Fetch should update only origin/main, not origin/feature, even though the
+	// clone's configured refspec covers all branches.
+	if err := Fetch(cloneDir); err != nil {
+		t.Fatalf("Fetch failed: %v", err)
+	}
+
+	if got := mustGitOut(t, cloneDir, "rev-parse", "refs/remotes/origin/main"); got != mainNew {
+		t.Fatalf("expected origin/main updated to %s, got %s", mainNew, got)
+	}
+	if got := mustGitOut(t, cloneDir, "rev-parse", "refs/remotes/origin/feature"); got != featureBefore {
+		t.Fatalf("expected origin/feature unchanged at %s, got %s", featureBefore, got)
+	}
+	// The advanced feature commit must NOT have been downloaded by a scoped fetch.
+	if _, err := runGit(cloneDir, "cat-file", "-e", featureNew); err == nil {
+		t.Fatalf("expected feature commit %s to be absent after scoped fetch", featureNew)
+	}
+}
+
 func mustGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -111,4 +170,17 @@ func mustGit(t *testing.T, dir string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, out)
 	}
+}
+
+func mustGitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
 }

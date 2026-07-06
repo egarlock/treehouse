@@ -153,11 +153,27 @@ func RemoveCleanWorktree(repoRoot, path string) error {
 	return err
 }
 
+// Fetch updates the default branch's remote-tracking ref from origin.
+//
+// It fetches only the default branch via an explicit refspec instead of a bare
+// "git fetch origin", which would honor the repository's configured fetch
+// refspec. On large monorepos that refspec is commonly
+// "+refs/heads/*:refs/remotes/origin/*", so a bare fetch downloads every branch
+// and can take many minutes. Treehouse only needs the default branch tip to
+// create and reset pooled worktrees, so a scoped, tag-less fetch is both correct
+// and dramatically faster. If the default branch cannot be determined, it falls
+// back to a full fetch to preserve prior behavior.
 func Fetch(repoRoot string) error {
 	if !HasRemote(repoRoot, "origin") {
 		return nil
 	}
-	_, err := runGit(repoRoot, "fetch", "origin")
+	branch, err := GetDefaultBranch(repoRoot)
+	if err != nil {
+		_, ferr := runGit(repoRoot, "fetch", "origin")
+		return ferr
+	}
+	refspec := fmt.Sprintf("refs/heads/%s:refs/remotes/origin/%s", branch, branch)
+	_, err = runGit(repoRoot, "fetch", "--no-tags", "origin", refspec)
 	return err
 }
 
