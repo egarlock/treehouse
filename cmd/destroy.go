@@ -11,10 +11,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/kunchenguid/treehouse/internal/config"
-	"github.com/kunchenguid/treehouse/internal/git"
-	"github.com/kunchenguid/treehouse/internal/pool"
-	"github.com/kunchenguid/treehouse/internal/ui"
+	"github.com/kunchenguid/treehouse/v3/internal/config"
+	"github.com/kunchenguid/treehouse/v3/internal/pool"
+	"github.com/kunchenguid/treehouse/v3/internal/ui"
+	"github.com/kunchenguid/treehouse/v3/internal/vcs"
 )
 
 var (
@@ -75,7 +75,39 @@ func destroyRunE(cmd *cobra.Command, args []string) error {
 		return errors.New("--include-leased cannot be combined with --all; name the exact worktree path instead (leased worktrees are never removed in bulk)")
 	}
 
-	preDestroy, err := destroyPreDestroyHooks()
+	var poolDir, wtPath string
+	var repoRoots []string
+	if destroyAll {
+		if len(args) == 0 {
+			return errors.New("--all requires a pool path; name the pool to clear, e.g. 'treehouse destroy . --all'")
+		}
+		targetPath, err := filepath.Abs(args[0])
+		if err != nil {
+			return err
+		}
+		poolDir, err = resolveDestroyPoolFromTarget(targetPath)
+		if err != nil {
+			return err
+		}
+	} else {
+		if len(args) == 0 {
+			return errors.New("specify a worktree path to destroy, or a pool path with --all")
+		}
+		var err error
+		wtPath, err = filepath.Abs(args[0])
+		if err != nil {
+			return err
+		}
+		poolDir, err = resolveDestroyPoolFromWorktree(wtPath)
+		if err != nil {
+			return err
+		}
+		if repoRoot, err := vcs.FindMainRepoRootFrom(wtPath); err == nil {
+			repoRoots = []string{repoRoot}
+		}
+	}
+
+	preDestroy, err := destroyPreDestroyHooks(repoRoots)
 	if err != nil {
 		return err
 	}
@@ -87,15 +119,11 @@ func destroyRunE(cmd *cobra.Command, args []string) error {
 		IncludeLeased:   destroyIncludeLeased,
 		PreDestroy:      preDestroy,
 	}
+	if destroyAll {
+		opts.InspectTargets = warnDestroyTargetRepoHooks
+	}
 
 	if destroyAll {
-		if len(args) == 0 {
-			return errors.New("--all requires a pool path; name the pool to clear, e.g. 'treehouse destroy . --all'")
-		}
-		poolDir, err := resolveDestroyPoolFromTarget(args[0])
-		if err != nil {
-			return err
-		}
 		result, err := pool.DestroyPool(poolDir, opts)
 		if err != nil {
 			return err
@@ -104,18 +132,6 @@ func destroyRunE(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if len(args) == 0 {
-		return errors.New("specify a worktree path to destroy, or a pool path with --all")
-	}
-
-	wtPath, err := filepath.Abs(args[0])
-	if err != nil {
-		return err
-	}
-	poolDir, err := resolveDestroyPoolFromWorktree(wtPath)
-	if err != nil {
-		return err
-	}
 	result, err := pool.DestroyWorktree(poolDir, wtPath, opts)
 	if err != nil {
 		return err
@@ -127,12 +143,31 @@ func destroyRunE(cmd *cobra.Command, args []string) error {
 // destroyPreDestroyHooks returns the user-level pre_destroy hooks. Destroy can
 // target a pool in another repository, and pre_destroy hooks are user-level
 // only, so it always loads them globally.
-func destroyPreDestroyHooks() ([]string, error) {
+func destroyPreDestroyHooks(repoRoots []string) ([]string, error) {
+	for _, repoRoot := range repoRoots {
+		config.WarnIfRepoHooksIgnored(repoRoot)
+	}
+
 	cfg, err := config.LoadGlobal()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 	return cfg.Hooks.PreDestroy, nil
+}
+
+func warnDestroyTargetRepoHooks(targets []pool.WorktreeEntry) {
+	seen := make(map[string]struct{})
+	for _, target := range targets {
+		repoRoot, err := vcs.FindMainRepoRootFrom(target.Path)
+		if err != nil {
+			continue
+		}
+		if _, ok := seen[repoRoot]; ok {
+			continue
+		}
+		seen[repoRoot] = struct{}{}
+		config.WarnIfRepoHooksIgnored(repoRoot)
+	}
 }
 
 // resolveDestroyPoolFromWorktree resolves the managed pool that owns a single
@@ -164,15 +199,15 @@ func resolveDestroyPoolFromTarget(targetPath string) (string, error) {
 		return candidate, nil
 	}
 
-	repoRoot, err := git.FindMainRepoRootFrom(abs)
+	repoRoot, err := vcs.FindMainRepoRootFrom(abs)
 	if err != nil {
-		return "", fmt.Errorf("cannot resolve a treehouse pool from %s: not a pool directory or git repository", targetPath)
+		return "", fmt.Errorf("cannot resolve a treehouse pool from %s: not a pool directory or git/jj repository", targetPath)
 	}
 	cfg, err := config.Load(repoRoot)
 	if err != nil {
 		return "", fmt.Errorf("failed to load config: %w", err)
 	}
-	return config.ResolvePoolDir(repoRoot, cfg.Root)
+	return config.ResolvePoolDir(repoRoot, config.ResolveRoot(rootFlag, cfg))
 }
 
 // destroySingleExit makes a single named destruction fail loudly when the
@@ -185,13 +220,17 @@ func destroySingleExit(result pool.DestroyResult, opts pool.DestroyOptions) erro
 		if skip.LeasedBulk {
 			continue
 		}
-		if len(skip.NeededFlags) > 0 {
-			return fmt.Errorf("did not destroy %s (%s); re-run with %s",
-				skip.Target.Name, skip.Target.Class, strings.Join(skip.NeededFlags, " "))
+		flags := skip.NeededFlags
+		if len(flags) == 0 && skip.NeededFlag != "" {
+			flags = []string{skip.NeededFlag}
 		}
-		if skip.NeededFlag != "" {
+		if len(flags) > 0 {
+			if unverifiedOtherFlavor(skip.Target) {
+				return fmt.Errorf("did not destroy %s (unverified %s-flavored worktree); re-run with %s to destroy it and migrate the pool",
+					skip.Target.Name, skip.Target.Flavor, strings.Join(flags, " "))
+			}
 			return fmt.Errorf("did not destroy %s (%s); re-run with %s",
-				skip.Target.Name, skip.Target.Class, skip.NeededFlag)
+				skip.Target.Name, skip.Target.Class, strings.Join(flags, " "))
 		}
 		return fmt.Errorf("did not destroy %s: %s", skip.Target.Name, skip.Target.Detail)
 	}
@@ -283,16 +322,41 @@ func destroySkipHint(s pool.DestroySkip) string {
 	if s.LeasedBulk {
 		return "leased: name the exact path with " + pool.IncludeLeasedFlag + " (never removed by --all)"
 	}
-	if len(s.NeededFlags) > 0 {
-		return "re-run with " + strings.Join(s.NeededFlags, " ") + " to include"
+	flags := s.NeededFlags
+	if len(flags) == 0 && s.NeededFlag != "" {
+		flags = []string{s.NeededFlag}
 	}
-	if s.NeededFlag != "" {
-		return "re-run with " + s.NeededFlag + " to include"
+	if len(flags) > 0 {
+		if unverifiedOtherFlavor(s.Target) {
+			return "unverified " + s.Target.Flavor + "-flavored worktree: re-run with " + strings.Join(flags, " ") + " to destroy it and migrate the pool"
+		}
+		return "re-run with " + strings.Join(flags, " ") + " to include"
 	}
 	if s.Target.Detail != "" {
 		return s.Target.Detail
 	}
 	return "left in place"
+}
+
+// unverifiedOtherFlavor reports an other-flavor worktree whose only obstacle
+// is the unverified class: nothing proved its work is unlanded, no lease or
+// live process claims it, verification in its own backend just failed, so the
+// honest framing for the opt-in flag is pool migration rather than discarding
+// unlanded or actively-claimed work.
+func unverifiedOtherFlavor(t pool.DestroyTarget) bool {
+	if !t.OtherFlavor {
+		return false
+	}
+	unverified := false
+	for _, class := range t.Classes {
+		switch class {
+		case pool.DestroyUnverified:
+			unverified = true
+		case pool.DestroyDirty, pool.DestroyUnmerged, pool.DestroyLeased, pool.DestroyInUse:
+			return false
+		}
+	}
+	return unverified
 }
 
 func destroyTag(t pool.DestroyTarget) string {

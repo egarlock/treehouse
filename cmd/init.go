@@ -8,17 +8,17 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/cobra"
 
-	"github.com/kunchenguid/treehouse/internal/config"
-	"github.com/kunchenguid/treehouse/internal/git"
+	"github.com/kunchenguid/treehouse/v3/internal/config"
+	"github.com/kunchenguid/treehouse/v3/internal/vcs"
 )
 
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Create a default treehouse.toml config file",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		repoRoot, err := git.FindRepoRoot()
+		repoRoot, err := vcs.FindMainRepoRoot()
 		if err != nil {
-			return fmt.Errorf("not in a git repository: %w", err)
+			return fmt.Errorf("not in a git or jj repository: %w", err)
 		}
 
 		dest := filepath.Join(repoRoot, "treehouse.toml")
@@ -37,8 +37,24 @@ var initCmd = &cobra.Command{
 			return fmt.Errorf("failed to write config: %w", err)
 		}
 
-		// Append a comment showing the root option.
-		if _, err := f.WriteString("\n# Worktree root directory (relative to repo root or absolute path).\n# Worktrees are placed under {root}/.treehouse/. Default: $HOME\n# Example: root = \"./\"\n"); err != nil {
+		// Append comments showing the optional keys.
+		if _, err := f.WriteString("\n# Worktree root directory (relative to repo root or absolute path).\n# Worktrees are placed under {root}/.treehouse/. Default: $HOME\n# Override per-command with the --root flag or the TREEHOUSE_ROOT env var.\n# Use \".\" to keep the pool in-project at <repo>/.treehouse/, next to the\n# code and removed with the project. Example: root = \".\"\n"); err != nil {
+			return fmt.Errorf("failed to write config: %w", err)
+		}
+
+		if _, err := f.WriteString("\n# Branch new and recycled worktrees are cut from.\n# Unset (default) infers it from the repository: origin/HEAD, then the\n# checked-out branch, then init.defaultBranch.\n# When set, the branch must exist locally or on origin; treehouse fails\n# rather than falling back to the inferred default.\n# Override per-command with the --base flag. Example: base_branch = \"develop\"\n"); err != nil {
+			return fmt.Errorf("failed to write config: %w", err)
+		}
+
+		if _, err := f.WriteString("\n# Unique worktree directory names.\n# Unset (default) names every slot's directory after the repository, so\n# tooling that derives per-checkout identity from the directory name reads\n# every slot as the same checkout.\n# Set true to name new slots <repo>-<slot>; worktrees already in the pool\n# keep their paths either way.\n# Override per-command with the --unique-leaf flag or the\n# TREEHOUSE_UNIQUE_LEAF env var. Example: unique_leaf = true\n"); err != nil {
+			return fmt.Errorf("failed to write config: %w", err)
+		}
+
+		if _, err := f.WriteString("\n# Where a newly created pool slot is placed.\n# Unset (default) uses {pool}/{slot}/{repo}. Placeholders: {pool}, {slot}\n# (required), {repo}, {repo_parent}; one of {pool} or {repo} is required as\n# well, to scope the template to this repository. {repo_parent} does not count:\n# two repositories side by side expand it identically. {repo} alone can still\n# collide between two repositories whose directories share a name.\n# Worktrees already in the pool keep their recorded paths.\n# Override per-command with the --worktree-path flag or the\n# TREEHOUSE_WORKTREE_PATH env var.\n# Example: worktree_path = \"{repo_parent}/{repo}-{slot}\"\n"); err != nil {
+			return fmt.Errorf("failed to write config: %w", err)
+		}
+
+		if _, err := f.WriteString("\n# Opt-in tracked-file copy-on-write sharing for fresh Git slots on macOS/APFS.\n# Values: off (default), fresh. Existing slots and ignored output are untouched.\n# Requires no concurrent destination writers during setup; see README.\n# Override with --apfs-sharing or TREEHOUSE_APFS_SHARING.\n# Example: apfs_sharing = \"fresh\"\n"); err != nil {
 			return fmt.Errorf("failed to write config: %w", err)
 		}
 

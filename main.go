@@ -4,8 +4,8 @@ import (
 	"os"
 	"runtime/debug"
 
-	"github.com/kunchenguid/treehouse/cmd"
-	"github.com/kunchenguid/treehouse/internal/updater"
+	"github.com/kunchenguid/treehouse/v3/cmd"
+	"github.com/kunchenguid/treehouse/v3/internal/updater"
 )
 
 var version = ""
@@ -30,6 +30,6 @@ func main() {
 
 	cmd.SetVersion(version)
 	if err := cmd.Execute(); err != nil {
-		os.Exit(1)
+		os.Exit(cmd.ExitCode(err))
 	}
 }

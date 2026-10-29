@@ -1,19 +1,303 @@
 package pool
 
 import (
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/treehouse/internal/process"
+	"github.com/kunchenguid/treehouse/v3/internal/config"
+	"github.com/kunchenguid/treehouse/v3/internal/process"
+	"github.com/kunchenguid/treehouse/v3/internal/vcs"
+	"github.com/kunchenguid/treehouse/v3/internal/vcs/gitvcs"
 )
 
-func setupRepo(t *testing.T) (repoDir, poolDir string) {
+// setupSharedClonePool builds two same-named clones of one origin. Keep real
+// pool resolution in the fixture: both clones must share one pool.
+func setupSharedClonePool(t *testing.T) (cloneA, cloneB, poolDir string) {
+	t.Helper()
+	t.Setenv("TREEHOUSE_VCS", "git")
+	cloneA, _ = setupRepo(t)
+	base := filepath.Dir(cloneA)
+	cloneB = filepath.Join(base, "other", filepath.Base(cloneA))
+	runGit(t, "", "clone", filepath.Join(base, "remote.git"), cloneB)
+	root := filepath.Join(base, "shared")
+	poolDir, err := config.ResolvePoolDir(cloneA, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPool, err := config.ResolvePoolDir(cloneB, root)
+	if err != nil || otherPool != poolDir {
+		t.Fatalf("same-origin clones must still resolve one pool: %q != %q (%v)", otherPool, poolDir, err)
+	}
+	return cloneA, cloneB, poolDir
+}
+
+func assertCloneCommonDir(t *testing.T, slot, repo string) {
+	t.Helper()
+	physical := func(path string) string {
+		t.Helper()
+		common, err := vcs.CommonGitDir(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		common, err = filepath.EvalSymlinks(common)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return common
+	}
+	if got, want := physical(slot), physical(repo); got != want {
+		t.Fatalf("slot %s belongs to %s, want requesting clone %s", slot, got, want)
+	}
+}
+
+func TestAcquire_CloneIdentity(t *testing.T) {
+	for _, leased := range []bool{false, true} {
+		t.Run(fmt.Sprintf("leased=%t", leased), func(t *testing.T) {
+			cloneA, cloneB, poolDir := setupSharedClonePool(t)
+			paths := make(map[string]string)
+			// A reuses its slot before B arrives; then both clones must keep
+			// reusing their own slot, despite the shared origin and pool.
+			for _, repo := range []string{cloneA, cloneA, cloneB, cloneA, cloneB} {
+				var path string
+				var err error
+				if leased {
+					path, err = AcquireLease(repo, poolDir, 2, nil, "clone-test")
+				} else {
+					path, err = Acquire(repo, poolDir, 2, nil)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertCloneCommonDir(t, path, repo)
+				if previous, ok := paths[repo]; ok && path != previous {
+					t.Fatalf("same-clone reuse changed path: %s -> %s", previous, path)
+				}
+				paths[repo] = path
+				if err := Release(poolDir, path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if paths[cloneA] == paths[cloneB] {
+				t.Fatalf("different clones exchanged slot %s", paths[cloneA])
+			}
+		})
+	}
+}
+
+func TestAcquire_CloneIdentityCapacity(t *testing.T) {
+	for _, leased := range []bool{false, true} {
+		t.Run(fmt.Sprintf("leased=%t", leased), func(t *testing.T) {
+			cloneA, cloneB, poolDir := setupSharedClonePool(t)
+			path, err := Acquire(cloneA, poolDir, 1, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := Release(poolDir, path); err != nil {
+				t.Fatal(err)
+			}
+			before, err := ReadState(poolDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			readme, err := os.ReadFile(filepath.Join(path, "README.md"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got string
+			if leased {
+				got, err = AcquireLease(cloneB, poolDir, 1, nil, "clone-b")
+			} else {
+				got, err = Acquire(cloneB, poolDir, 1, nil)
+			}
+			if err == nil || !strings.Contains(err.Error(), "max_trees = 1") || !strings.Contains(err.Error(), "1 belong to another clone") || got != "" {
+				t.Fatalf("expected explicit capacity failure, got path=%q err=%v", got, err)
+			}
+			after, err := ReadState(poolDir)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatalf("capacity failure changed existing state: %#v -> %#v (%v)", before, after, err)
+			}
+			assertCloneCommonDir(t, path, cloneA)
+			if content, err := os.ReadFile(filepath.Join(path, "README.md")); err != nil || string(content) != string(readme) {
+				t.Fatalf("foreign slot was removed or changed: %q, want %q (%v)", content, readme, err)
+			}
+			if reused, err := Acquire(cloneA, poolDir, 1, nil); err != nil || reused != path {
+				t.Fatalf("owning clone could not reuse preserved slot: %q (%v)", reused, err)
+			}
+		})
+	}
+}
+
+func TestAcquire_CloneIdentitySymlinkAlias(t *testing.T) {
+	repo, poolDir := setupRepo(t)
+	alias := filepath.Join(filepath.Dir(repo), "alias")
+	if err := os.Symlink(repo, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	path, err := Acquire(repo, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Release(poolDir, path); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise an alias in the slot's metadata as well as in the caller's
+	// path. Git versions may themselves canonicalize one or both spellings.
+	cmd := exec.Command("git", "rev-parse", "--absolute-git-dir")
+	cmd.Dir = path
+	gitDir, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commonAlias := filepath.Join(alias, ".git")
+	if err := os.WriteFile(filepath.Join(strings.TrimSpace(string(gitDir)), "commondir"), []byte(commonAlias+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, requester := range []string{repo, alias} {
+		reused, err := Acquire(requester, poolDir, 1, nil)
+		if err != nil || reused != path {
+			t.Fatalf("physical clone alias must reuse %s: %q (%v)", path, reused, err)
+		}
+		if err := Release(poolDir, reused); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestAcquire_CloneIdentityCaseAlias(t *testing.T) {
+	for _, leased := range []bool{false, true} {
+		t.Run(fmt.Sprintf("leased=%t", leased), func(t *testing.T) {
+			repo, poolDir := setupRepo(t)
+			alias := filepath.Join(filepath.Dir(repo), strings.ToUpper(filepath.Base(repo)))
+			repoInfo, err := os.Stat(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if aliasInfo, err := os.Stat(alias); err != nil || !os.SameFile(repoInfo, aliasInfo) {
+				t.Skipf("filesystem is case-sensitive: %s is not %s (%v)", alias, repo, err)
+			}
+			acquire := func(requester string) (string, error) {
+				if leased {
+					return AcquireLease(requester, poolDir, 1, nil, "case-test")
+				}
+				return Acquire(requester, poolDir, 1, nil)
+			}
+			path, err := acquire(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := Release(poolDir, path); err != nil {
+				t.Fatal(err)
+			}
+			// Spell the slot's common dir with other letter case, as a clone
+			// reached through a differently cased path records it.
+			cmd := exec.Command("git", "rev-parse", "--absolute-git-dir")
+			cmd.Dir = path
+			gitDir, err := cmd.Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(strings.TrimSpace(string(gitDir)), "commondir"), []byte(filepath.Join(alias, ".git")+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			for _, requester := range []string{repo, alias} {
+				reused, err := acquire(requester)
+				if err != nil || reused != path {
+					t.Fatalf("differently cased spelling of one clone must reuse %s: %q (%v)", path, reused, err)
+				}
+				if err := Release(poolDir, reused); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestAcquire_CloneIdentityUnreadableCandidate(t *testing.T) {
+	repo, poolDir := setupRepo(t)
+	path, err := Acquire(repo, poolDir, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Release(poolDir, path); err != nil {
+		t.Fatal(err)
+	}
+	// Keep the slot and its marker, but make its Git identity unresolvable.
+	marker := []byte("gitdir: " + filepath.Join(filepath.Dir(repo), "missing.git") + "\n")
+	if err := os.WriteFile(filepath.Join(path, ".git"), marker, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vcs.CommonGitDir(path); err == nil {
+		t.Fatal("expected unreadable candidate identity")
+	}
+	if _, err := acquisitionCommonGitDir(path); err == nil {
+		t.Fatal("unreadable Git identity must be an error, not an unsupported backend")
+	}
+	before, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Acquire(repo, poolDir, 1, nil); err == nil || got != "" || !strings.Contains(err.Error(), "0 belong to another clone; 1 whose clone identity cannot be verified; max_trees = 1") {
+		t.Fatalf("expected unverifiable-identity capacity failure, got path=%q err=%v", got, err)
+	}
+	fresh, err := Acquire(repo, poolDir, 2, nil)
+	if err != nil || fresh == path {
+		t.Fatalf("unreadable candidate must be skipped: %q (%v)", fresh, err)
+	}
+	assertCloneCommonDir(t, fresh, repo)
+	after, err := ReadState(poolDir)
+	if err != nil || len(after.Worktrees) != 2 || !reflect.DeepEqual(before.Worktrees[0], after.Worktrees[0]) {
+		t.Fatalf("unreadable candidate state changed: %#v (%v)", after, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(path, ".git")); err != nil || string(got) != string(marker) {
+		t.Fatalf("unreadable candidate marker changed: %q (%v)", got, err)
+	}
+}
+
+func TestRelease_CloneIdentityExistingState(t *testing.T) {
+	repo, poolDir := setupRepo(t)
+	path := filepath.Join(poolDir, "7", filepath.Base(repo))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := vcs.AddWorktree(repo, path, "main"); err != nil {
+		t.Fatal(err)
+	}
+	// Existing state has no persisted clone identity. Seed authentication is
+	// still required, exactly as it was before clone-aware selection.
+	entry := WorktreeEntry{Name: "7", Path: path, CreatedAt: time.Now(), Leased: true}
+	setSeedInventory(&entry, []string{}, true)
+	if err := WriteState(poolDir, State{Worktrees: []WorktreeEntry{entry}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, find := range []func() (*WorktreeEntry, error){
+		func() (*WorktreeEntry, error) { return FindByName(poolDir, "7") },
+		func() (*WorktreeEntry, error) { return FindByPath(poolDir, path) },
+	} {
+		found, err := find()
+		if err != nil || found == nil || found.Path != path {
+			t.Fatalf("existing slot no longer resolves: %#v (%v)", found, err)
+		}
+	}
+	if err := Release(poolDir, path); err != nil {
+		t.Fatalf("return of existing slot failed: %v", err)
+	}
+	if reused, err := Acquire(repo, poolDir, 1, nil); err != nil || reused != path {
+		t.Fatalf("existing slot no longer reusable by its clone: %q (%v)", reused, err)
+	}
+}
+
+func setupRepo(t *testing.T, initFlags ...string) (repoDir, poolDir string) {
 	t.Helper()
 	base := t.TempDir()
 	base, err := filepath.EvalSymlinks(base)
@@ -25,8 +309,8 @@ func setupRepo(t *testing.T) (repoDir, poolDir string) {
 	repoDir = filepath.Join(base, "myrepo")
 	poolDir = filepath.Join(base, "pool")
 
-	runGit(t, "", "init", "--bare", "--initial-branch=main", bareDir)
-	runGit(t, "", "init", "--initial-branch=main", repoDir)
+	runGit(t, "", append(append([]string{"init", "--bare", "--initial-branch=main"}, initFlags...), bareDir)...)
+	runGit(t, "", append(append([]string{"init", "--initial-branch=main"}, initFlags...), repoDir)...)
 	runGit(t, repoDir, "config", "user.email", "test@test.com")
 	runGit(t, repoDir, "config", "user.name", "Test")
 	runGit(t, repoDir, "remote", "add", "origin", bareDir)
@@ -38,6 +322,104 @@ func setupRepo(t *testing.T) (repoDir, poolDir string) {
 	runGit(t, repoDir, "commit", "-m", "initial")
 	runGit(t, repoDir, "push", "-u", "origin", "main")
 	return repoDir, poolDir
+}
+
+func acquireDisposableFromEachClone(t *testing.T) (repoA, poolDir, worktreeA, worktreeB string) {
+	t.Helper()
+	repoA, repoB, poolDir := setupSharedClonePool(t)
+
+	var err error
+	worktreeA, err = Acquire(repoA, poolDir, 4, nil)
+	if err != nil {
+		t.Fatalf("Acquire from first clone failed: %v", err)
+	}
+	// Keep the first slot reserved until the second clone has created its own
+	// slot. Both can then be returned to the shared pool as disposable targets.
+	worktreeB, err = Acquire(repoB, poolDir, 4, nil)
+	if err != nil {
+		t.Fatalf("Acquire from second clone failed: %v", err)
+	}
+	if err := Release(poolDir, worktreeA); err != nil {
+		t.Fatalf("Release first clone worktree failed: %v", err)
+	}
+	if err := Release(poolDir, worktreeB); err != nil {
+		t.Fatalf("Release second clone worktree failed: %v", err)
+	}
+	return repoA, poolDir, worktreeA, worktreeB
+}
+
+func TestStaleJJAuthenticationRequiresSignedInventory(t *testing.T) {
+	base := t.TempDir()
+	poolDir := filepath.Join(base, "pool")
+	if err := os.MkdirAll(poolDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	worktree := filepath.Join(base, "slot", "worktree")
+	marker := filepath.Join(worktree, ".jj", "repo")
+	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte("store"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := gitvcs.PrepareJJSeededCleanup(worktree); err != nil {
+		t.Fatal(err)
+	}
+	authDir := filepath.Join(filepath.Dir(worktree), ".treehouse-jj-seed-auth")
+	authEntries, err := os.ReadDir(authDir)
+	if err != nil || len(authEntries) != 1 {
+		t.Fatalf("authentication entries = %v, %v", authEntries, err)
+	}
+	authPath := filepath.Join(authDir, authEntries[0].Name())
+	entry := WorktreeEntry{Name: "slot", Path: worktree}
+	setSeedInventory(&entry, []string{"selected.env"}, true)
+	if err := WriteState(poolDir, State{Worktrees: []WorktreeEntry{entry}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(worktree); err != nil {
+		t.Fatal(err)
+	}
+	// Create the forged file at a temporary path before removing the original
+	// auth file so the new file is guaranteed a different inode. On Linux tmpfs
+	// a remove-then-create at the same path can reuse the freed inode, which
+	// would make fileIdentity match and the fail-closed check non-deterministic.
+	forgedPath := authPath + ".forged"
+	if err := os.WriteFile(forgedPath, []byte("forged user data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(authPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(forgedPath, authPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := removeAuthenticatedStaleJJSeedState(poolDir, State{Worktrees: []WorktreeEntry{entry}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(authPath); err != nil {
+		t.Fatalf("unsigned state removed authentication file: %v", err)
+	}
+	signed, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signed.Worktrees) != 1 {
+		t.Fatalf("signed state entries = %d, want 1", len(signed.Worktrees))
+	}
+	if _, err := List(poolDir); err == nil {
+		t.Fatal("expected forged authentication identity to fail closed")
+	}
+	if _, err := os.Stat(authPath); err != nil {
+		t.Fatalf("forged authentication file was removed: %v", err)
+	}
+	healed, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(healed.Worktrees) != 1 {
+		t.Fatalf("signed authorization was discarded after failed cleanup: %#v", healed.Worktrees)
+	}
 }
 
 func setupLocalRepo(t *testing.T) (repoDir, poolDir string) {
@@ -92,6 +474,830 @@ func TestAcquire_RunsPostCreateHookInWorktree(t *testing.T) {
 	sentinel := filepath.Join(wtPath, "hook-sentinel.txt")
 	if _, err := os.Stat(sentinel); err != nil {
 		t.Fatalf("expected post_create hook to create %s: %v", sentinel, err)
+	}
+}
+
+func TestAcquire_SeedsWorktreeIncludeOnCreateAndReuse(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	write := func(name, contents string) {
+		t.Helper()
+		path := filepath.Join(repoDir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(".gitignore", ".env*\nlocal/\ntracked.env\n")
+	write(".worktreeinclude", ".env*\n!.env.local\nlocal/*\n!local/archive/\nlocal/archive/keep.txt\ntracked.env\n")
+	write(".env", "first\n")
+	write(".env.local", "local\n")
+	write("local/config.txt", "config\n")
+	write("local/archive/old.txt", "old\n")
+	write("local/archive/keep.txt", "keep\n")
+	write("tracked.env", "committed\n")
+	runGit(t, repoDir, "add", "-f", ".gitignore", ".worktreeinclude", "tracked.env")
+	runGit(t, repoDir, "commit", "-m", "add worktree include")
+	write("tracked.env", "uncommitted\n")
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFileContents(t, filepath.Join(wtPath, ".env"), "first\n")
+	if _, err := os.Stat(filepath.Join(wtPath, ".env.local")); !os.IsNotExist(err) {
+		t.Fatalf("file negation was not honored: %v", err)
+	}
+	assertFileContents(t, filepath.Join(wtPath, "local", "config.txt"), "config\n")
+	assertFileContents(t, filepath.Join(wtPath, "tracked.env"), "committed\n")
+	if _, err := os.Stat(filepath.Join(wtPath, "local", "archive", "old.txt")); !os.IsNotExist(err) {
+		t.Fatalf("excluded file exists: %v", err)
+	}
+	assertFileContents(t, filepath.Join(wtPath, "local", "archive", "keep.txt"), "keep\n")
+
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+	write(".env", "second\n")
+	reused, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused != wtPath {
+		t.Fatalf("got worktree %s, want reused %s", reused, wtPath)
+	}
+	assertFileContents(t, filepath.Join(reused, ".env"), "second\n")
+}
+
+func TestAcquire_ManifestOverrideRefreshesAndRemovesSeedsOnReuse(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	for name, contents := range map[string]string{
+		".gitignore":       "*.seed\n",
+		".worktreeinclude": "default.seed\n",
+		"default.seed":     "default\n",
+		"local.seed":       "first\n",
+	} {
+		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runGit(t, repoDir, "add", ".gitignore", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "configure seeds")
+	options := AcquireOptions{IncludeManifest: []byte("local.seed\n")}
+	wtPath, err := AcquireWithOptions(repoDir, poolDir, 1, nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFileContents(t, filepath.Join(wtPath, "local.seed"), "first\n")
+	if _, err := os.Stat(filepath.Join(wtPath, "default.seed")); !os.IsNotExist(err) {
+		t.Fatalf("override did not replace committed selection: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wtPath, "unmanaged.seed"), []byte("keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "local.seed"), []byte("second\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an exited owner without return so reuse must clean old seeds itself.
+	clearOwnerReservation(t, poolDir, wtPath)
+	reused, err := AcquireWithOptions(repoDir, poolDir, 1, nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused != wtPath {
+		t.Fatalf("acquired %s, want reused %s", reused, wtPath)
+	}
+	assertFileContents(t, filepath.Join(reused, "local.seed"), "second\n")
+
+	clearOwnerReservation(t, poolDir, wtPath)
+	empty, err := AcquireWithOptions(repoDir, poolDir, 1, nil, AcquireOptions{IncludeManifest: []byte{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty != wtPath {
+		t.Fatalf("acquired %s, want reused %s", empty, wtPath)
+	}
+	for _, name := range []string{"local.seed", "default.seed"} {
+		if _, err := os.Stat(filepath.Join(empty, name)); !os.IsNotExist(err) {
+			t.Fatalf("empty override left %s: %v", name, err)
+		}
+	}
+	assertFileContents(t, filepath.Join(empty, "unmanaged.seed"), "keep\n")
+}
+
+func TestAcquire_IgnoresDirtyAndUntrackedWorktreeInclude(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("*.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "secret.env"), []byte("secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".gitignore")
+	runGit(t, repoDir, "commit", "-m", "no manifest")
+
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("secret.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wtPath, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "secret.env")); !os.IsNotExist(err) {
+		t.Fatal("untracked .worktreeinclude selected a seed")
+	}
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("selected.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "selected.env"), []byte("selected\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "extra.env"), []byte("extra\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "committed manifest")
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("selected.env\nextra.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reused, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFileContents(t, filepath.Join(reused, "selected.env"), "selected\n")
+	if _, err := os.Stat(filepath.Join(reused, "extra.env")); !os.IsNotExist(err) {
+		t.Fatal("dirty .worktreeinclude selected an extra seed")
+	}
+	if _, err := os.Stat(filepath.Join(reused, "secret.env")); !os.IsNotExist(err) {
+		t.Fatal("untracked extra pattern leaked into a later acquire")
+	}
+}
+
+func TestAcquire_RemovesObsoleteSeedOnReuse(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("*.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("old.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "old.env"), []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".gitignore", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "add seed manifest")
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFileContents(t, filepath.Join(wtPath, "old.env"), "old\n")
+	if err := os.WriteFile(filepath.Join(wtPath, "unmanaged.env"), []byte("keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "remove obsolete seed")
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "old.env")); !os.IsNotExist(err) {
+		t.Fatalf("obsolete seed survived reuse: %v", err)
+	}
+	assertFileContents(t, filepath.Join(wtPath, "unmanaged.env"), "keep\n")
+}
+
+func TestReleaseRemovesSeedHiddenByLocalManifestCommit(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("secret.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("secret.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "secret.env"), []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".gitignore", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "seed secret")
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtPath, ".worktreeinclude"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, wtPath, "add", ".worktreeinclude")
+	runGit(t, wtPath, "-c", "user.email=test@test.com", "-c", "user.name=Test", "commit", "-m", "hide seed")
+
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "secret.env")); !os.IsNotExist(err) {
+		t.Fatalf("seed hidden by local commit survived release: %v", err)
+	}
+}
+
+// TestReleaseOfRecoveredMissingStateEntryLeavesUnknownSeeds covers a worktree
+// restored from disk: it stays leased and is never handed out, and a return
+// naming it releases it but cannot clean seeded files it has no record of.
+func TestReleaseOfRecoveredMissingStateEntryLeavesUnknownSeeds(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("secret.env\nunmanaged.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("secret.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "secret.env"), []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".gitignore", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "seed secret")
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteState(poolDir, State{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtPath, "unmanaged.env"), []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtPath, ".worktreeinclude"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, wtPath, "add", ".worktreeinclude")
+	runGit(t, wtPath, "-c", "user.email=test@test.com", "-c", "user.name=Test", "commit", "-m", "hide seed")
+
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("Acquire reused a recovered worktree with an unknown seed inventory")
+	}
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Worktrees) != 1 || !state.Worktrees[0].Leased || state.Worktrees[0].LeaseHolder != RecoveredLeaseHolder {
+		t.Fatalf("recovered worktree is not quarantined: %#v", state.Worktrees)
+	}
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatalf("return naming a recovered worktree: %v", err)
+	}
+	assertFileContents(t, filepath.Join(wtPath, "secret.env"), "secret\n")
+	assertFileContents(t, filepath.Join(wtPath, "unmanaged.env"), "keep\n")
+}
+
+func TestAcquire_FinalStateWriteFailurePreservesSeedInventoryForRecovery(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("secret.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("secret.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "secret.env"), []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".gitignore", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "seed secret")
+	if err := os.MkdirAll(poolDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteState(poolDir, State{}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWriteState := writeState
+	writeState = func(poolDir string, state State) error {
+		if len(state.Worktrees) == 1 && state.Worktrees[0].OwnerPID != 0 {
+			return errors.New("state write failed")
+		}
+		return oldWriteState(poolDir, state)
+	}
+	t.Cleanup(func() { writeState = oldWriteState })
+
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("expected final state write to fail")
+	}
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Worktrees) != 1 {
+		t.Fatalf("recovered state = %#v, want one quarantined worktree", state.Worktrees)
+	}
+	wtPath := state.Worktrees[0].Path
+	if err := os.WriteFile(filepath.Join(wtPath, ".worktreeinclude"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, wtPath, "add", ".worktreeinclude")
+	runGit(t, wtPath, "-c", "user.email=test@test.com", "-c", "user.name=Test", "commit", "-m", "hide seed")
+
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "secret.env")); !os.IsNotExist(err) {
+		t.Fatalf("seed survived recovery after final state write failure: %v", err)
+	}
+}
+
+func TestAcquire_InitialStateWriteFailureRecoversCreatedWorktree(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	oldWriteState := writeState
+	writeState = func(string, State) error { return errors.New("state write failed") }
+	t.Cleanup(func() { writeState = oldWriteState })
+
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("expected initial state write to fail")
+	}
+	if _, err := os.Stat(stateFilePath(poolDir)); !os.IsNotExist(err) {
+		t.Fatalf("state file unexpectedly exists: %v", err)
+	}
+
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Worktrees) != 1 || !state.Worktrees[0].Leased || state.Worktrees[0].LeaseHolder != RecoveredLeaseHolder {
+		t.Fatalf("created worktree was not conservatively recovered: %#v", state.Worktrees)
+	}
+}
+
+func TestAcquire_ReusedFinalStateWriteFailureQuarantinesNewSeeds(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("*.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("old.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "old.env"), []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".gitignore", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "seed old file")
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("secret.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "secret.env"), []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "replace seed")
+
+	oldWriteState := writeState
+	writeState = func(poolDir string, state State) error {
+		if len(state.Worktrees) == 1 && state.Worktrees[0].OwnerPID != 0 {
+			return errors.New("state write failed")
+		}
+		return oldWriteState(poolDir, state)
+	}
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("expected final state write to fail")
+	}
+	writeState = oldWriteState
+	t.Cleanup(func() { writeState = oldWriteState })
+
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Worktrees) != 1 || !state.Worktrees[0].Leased {
+		t.Fatalf("reused worktree was not quarantined: %#v", state.Worktrees)
+	}
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("quarantined worktree was handed to another owner")
+	}
+	if err := os.WriteFile(filepath.Join(wtPath, ".worktreeinclude"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, wtPath, "add", ".worktreeinclude")
+	runGit(t, wtPath, "-c", "user.email=test@test.com", "-c", "user.name=Test", "commit", "-m", "hide new seed")
+
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "secret.env")); !os.IsNotExist(err) {
+		t.Fatalf("new seed survived recovery after final state write failure: %v", err)
+	}
+}
+
+func TestAcquire_ReusedRepeatedStateWriteFailureKeepsSeedInventoryUnknown(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("*.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("old.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "old.env"), []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".gitignore", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "seed old file")
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("secret.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "secret.env"), []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "replace seed")
+
+	oldWriteState := writeState
+	writes := 0
+	writeState = func(poolDir string, state State) error {
+		writes++
+		if writes > 1 {
+			return errors.New("state write failed")
+		}
+		return oldWriteState(poolDir, state)
+	}
+	t.Cleanup(func() { writeState = oldWriteState })
+
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("expected final and fallback state writes to fail")
+	}
+	writeState = oldWriteState
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Worktrees) != 1 || state.Worktrees[0].SeedInventoryKnown {
+		t.Fatalf("durable quarantine trusts incomplete inventory: %#v", state.Worktrees)
+	}
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("worktree with unknown seed inventory became reusable")
+	}
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatalf("return naming a worktree with an unknown seed inventory: %v", err)
+	}
+}
+
+// TestRelease_FailedSeedingQuarantineStaysLeasedUntilNamedReturn covers an
+// acquisition whose seeding failed: ReadState treats its unknown inventory as
+// recovered, so it is never handed out and only a return naming it frees it.
+func TestRelease_FailedSeedingQuarantineStaysLeasedUntilNamedReturn(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Worktrees[0].SeedInventoryKnown = false
+	state.Worktrees[0].Leased = true
+	state.Worktrees[0].LeaseHolder = "quarantined: worktree seeding failed"
+	if err := WriteState(poolDir, state); err != nil {
+		t.Fatal(err)
+	}
+	partialPath := filepath.Join(wtPath, "partial.env")
+	if err := os.WriteFile(partialPath, []byte("partial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err = ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.Worktrees[0].Leased || state.Worktrees[0].SeedInventoryKnown || state.Worktrees[0].LeaseHolder != RecoveredLeaseHolder {
+		t.Fatalf("unsafe quarantine was cleared: %#v", state.Worktrees[0])
+	}
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("Acquire reused a failed-seeding quarantine")
+	}
+	assertFileContents(t, partialPath, "partial\n")
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatalf("return naming a failed-seeding quarantine: %v", err)
+	}
+}
+
+func TestAcquire_ReusedCommittedFinalStateWriteErrorReturnsAcquisition(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("secret.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("secret.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "secret.env"), []byte("secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".gitignore", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "seed secret")
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWriteState := writeState
+	writes := 0
+	writeState = func(poolDir string, state State) error {
+		writes++
+		if err := oldWriteState(poolDir, state); err != nil {
+			return err
+		}
+		if writes == 2 {
+			return errors.New("directory sync failed after commit")
+		}
+		return nil
+	}
+	t.Cleanup(func() { writeState = oldWriteState })
+
+	reused, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed after its final state was committed: %v", err)
+	}
+	if reused != wtPath {
+		t.Fatalf("got worktree %s, want reused %s", reused, wtPath)
+	}
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Worktrees) != 1 || state.Worktrees[0].OwnerPID == 0 || state.Worktrees[0].Leased {
+		t.Fatalf("committed acquisition state was not preserved: %#v", state.Worktrees)
+	}
+}
+
+func TestAcquire_NewCommittedStateWriteErrorsReturnLease(t *testing.T) {
+	for _, failAt := range []int{1, 2} {
+		t.Run(fmt.Sprintf("write-%d", failAt), func(t *testing.T) {
+			repoDir, poolDir := setupLocalRepo(t)
+			oldWriteState := writeState
+			writes := 0
+			writeState = func(poolDir string, state State) error {
+				writes++
+				if err := oldWriteState(poolDir, state); err != nil {
+					return err
+				}
+				if writes == failAt {
+					return errors.New("directory sync failed after commit")
+				}
+				return nil
+			}
+			t.Cleanup(func() { writeState = oldWriteState })
+
+			lease, err := AcquireLeaseInfo(repoDir, poolDir, 1, nil, "test-holder")
+			if err != nil {
+				t.Fatalf("AcquireLeaseInfo failed after state was committed: %v", err)
+			}
+			state, err := ReadState(poolDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(state.Worktrees) != 1 || !state.Worktrees[0].Leased || state.Worktrees[0].LeaseID != lease.LeaseID {
+				t.Fatalf("committed lease state was not preserved: %#v", state.Worktrees)
+			}
+		})
+	}
+}
+
+func TestAcquire_QuarantinesReusedWorktreeAfterPartialSeedFailure(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("partial.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".gitignore")
+	runGit(t, repoDir, "commit", "-m", "ignore partial seed")
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+	oldSeedWorktree := seedWorktree
+	seedWorktree = func(_ string, path string, _ []byte) ([]string, error) {
+		if err := os.WriteFile(filepath.Join(path, "partial.env"), []byte("partial\n"), 0o644); err != nil {
+			return nil, err
+		}
+		return []string{"partial.env"}, errors.New("seeding failed after partial write")
+	}
+	t.Cleanup(func() { seedWorktree = oldSeedWorktree })
+
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("expected seeding to fail")
+	}
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Worktrees) != 1 || !state.Worktrees[0].Leased {
+		t.Fatalf("partially seeded worktree was not quarantined: %#v", state.Worktrees)
+	}
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "partial.env")); !os.IsNotExist(err) {
+		t.Fatalf("partial seed survived quarantine release: %v", err)
+	}
+}
+
+func TestAcquire_RemovesPartialSeedsWhenQuarantineWriteFails(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("partial.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".gitignore")
+	runGit(t, repoDir, "commit", "-m", "ignore partial seed")
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+
+	oldSeedWorktree := seedWorktree
+	seedWorktree = func(_ string, path string, _ []byte) ([]string, error) {
+		if err := os.WriteFile(filepath.Join(path, "partial.env"), []byte("partial\n"), 0o644); err != nil {
+			return nil, err
+		}
+		return []string{"partial.env"}, errors.New("seeding failed after partial write")
+	}
+	oldWriteState := writeState
+	writes := 0
+	writeState = func(poolDir string, state State) error {
+		writes++
+		if writes == 2 {
+			return errors.New("quarantine write failed")
+		}
+		return oldWriteState(poolDir, state)
+	}
+	t.Cleanup(func() {
+		seedWorktree = oldSeedWorktree
+		writeState = oldWriteState
+	})
+
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("expected seeding and quarantine write to fail")
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "partial.env")); !os.IsNotExist(err) {
+		t.Fatalf("partial seed survived failed quarantine write: %v", err)
+	}
+}
+
+func TestAcquire_QuarantinesNewWorktreeWhenSeedCleanupFails(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	oldSeedWorktree := seedWorktree
+	oldRemoveWorktree := removeWorktree
+	seedWorktree = func(string, string, []byte) ([]string, error) { return nil, errors.New("seeding failed") }
+	removeWorktree = func(string, string) error { return errors.New("cleanup failed") }
+	t.Cleanup(func() {
+		seedWorktree = oldSeedWorktree
+		removeWorktree = oldRemoveWorktree
+	})
+
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("expected seeding to fail")
+	}
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Worktrees) != 1 || !state.Worktrees[0].Leased {
+		t.Fatalf("failed cleanup worktree was not quarantined: %#v", state.Worktrees)
+	}
+}
+
+func TestAcquire_SeedingDoesNotFollowWorktreeSymlinks(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte(".env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte(".env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".gitignore", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "seed env")
+	if err := os.WriteFile(filepath.Join(repoDir, ".env"), []byte("seeded\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatal(err)
+	}
+
+	sentinel := filepath.Join(t.TempDir(), "sentinel")
+	if err := os.WriteFile(sentinel, []byte("safe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	probe := filepath.Join(t.TempDir(), "symlink-probe")
+	if err := os.Symlink(sentinel, probe); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Remove(probe); err != nil {
+		t.Fatal(err)
+	}
+	seeded := filepath.Join(wtPath, ".env")
+	oldSeedWorktree := seedWorktree
+	seedWorktree = func(repoRoot, path string, manifest []byte) ([]string, error) {
+		if err := os.Symlink(sentinel, filepath.Join(path, ".env")); err != nil {
+			return nil, err
+		}
+		return oldSeedWorktree(repoRoot, path, manifest)
+	}
+	t.Cleanup(func() { seedWorktree = oldSeedWorktree })
+
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("expected acquisition to fail rather than follow the destination symlink")
+	}
+	assertFileContents(t, sentinel, "safe\n")
+	info, err := os.Lstat(seeded)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("destination symlink was unexpectedly replaced: info=%v err=%v", info, err)
+	}
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Worktrees) != 1 || !state.Worktrees[0].Leased {
+		t.Fatalf("failed reused worktree was not quarantined: %#v", state.Worktrees)
+	}
+}
+
+func TestAcquire_DoesNotSeedFilesTrackedByTargetWorktree(t *testing.T) {
+	repoDir, poolDir := setupRepo(t)
+	tracked := filepath.Join(repoDir, "tracked.env")
+	if err := os.WriteFile(tracked, []byte("committed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", "tracked.env")
+	runGit(t, repoDir, "commit", "-m", "track env")
+	runGit(t, repoDir, "push", "origin", "main")
+
+	runGit(t, repoDir, "checkout", "-b", "feature")
+	runGit(t, repoDir, "remote", "set-head", "origin", "main")
+	runGit(t, repoDir, "rm", "tracked.env")
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("tracked.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".worktreeinclude"), []byte("tracked.env\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "add", ".gitignore", ".worktreeinclude")
+	runGit(t, repoDir, "commit", "-m", "ignore env")
+	if err := os.WriteFile(tracked, []byte("uncommitted\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFileContents(t, filepath.Join(wtPath, "tracked.env"), "committed\n")
+}
+
+func assertFileContents(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ReplaceAll(string(got), "\r\n", "\n") != want {
+		t.Fatalf("%s = %q, want %q", path, got, want)
 	}
 }
 
@@ -154,6 +1360,88 @@ func TestAcquire_DoesNotReuseWorktreeReservedByPostCreateHook(t *testing.T) {
 	if acquired == wtPath {
 		t.Fatalf("hook acquire reused reserved worktree %s", wtPath)
 	}
+}
+
+func TestAcquire_DoesNotResetWorktreeAheadOfBaseWithDeadOwner(t *testing.T) {
+	repoDir, poolDir := setupRepo(t)
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+
+	// Simulate an agent that committed work and then went away: a clean working
+	// tree whose HEAD is ahead of base, with no live owner reservation.
+	if err := os.WriteFile(filepath.Join(wtPath, "unlanded.txt"), []byte("keep me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, wtPath, "add", "unlanded.txt")
+	runGit(t, wtPath, "commit", "-m", "committed but unlanded")
+	head := gitOut(t, wtPath, "rev-parse", "HEAD")
+	clearOwnerReservation(t, poolDir, wtPath)
+
+	// The one slot holds unlanded work, so acquire must fail closed rather than
+	// reset it. A pool of one forces the choice: reuse-and-reset or refuse.
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err == nil {
+		t.Fatal("expected Acquire to fail closed rather than reset unlanded work")
+	}
+
+	if got := gitOut(t, wtPath, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("expected unlanded HEAD %s preserved, got %s", head, got)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "unlanded.txt")); err != nil {
+		t.Fatalf("expected unlanded commit preserved on disk: %v", err)
+	}
+}
+
+func TestAcquire_ReusesMergedIdleSlotWithDeadOwner(t *testing.T) {
+	repoDir, poolDir := setupRepo(t)
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	// A clean slot at base with no live owner is genuinely disposable and must
+	// still be reused, so the unlanded-work guard does not over-skip.
+	clearOwnerReservation(t, poolDir, wtPath)
+
+	reused, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatalf("Acquire should reuse a merged idle slot: %v", err)
+	}
+	if reused != wtPath {
+		t.Fatalf("expected reuse of idle slot %s, got %s", wtPath, reused)
+	}
+}
+
+func clearOwnerReservation(t *testing.T, poolDir, wtPath string) {
+	t.Helper()
+	if err := WithStateLock(poolDir, func() error {
+		state, err := ReadState(poolDir)
+		if err != nil {
+			return err
+		}
+		for i := range state.Worktrees {
+			if state.Worktrees[i].Path == wtPath {
+				state.Worktrees[i].OwnerPID = 0
+				state.Worktrees[i].OwnerStartedAt = 0
+			}
+		}
+		return WriteState(poolDir, state)
+	}); err != nil {
+		t.Fatalf("clear owner reservation failed: %v", err)
+	}
+}
+
+func gitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %s failed: %v", strings.Join(args, " "), err)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func TestRelease_DoesNotDependOnCurrentWorkingDirectory(t *testing.T) {
@@ -801,15 +2089,16 @@ func TestExecuteDestroy_ReclassifiesBeforeReservation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadState failed: %v", err)
 	}
-	planned := classifyForDestroy(state.Worktrees[0], defaultRef)
-	measureDestroySize(&planned)
+	planned := classifyForDestroy(state.Worktrees[0], repoDir, defaultRef)
+	measureDestroySize(poolDir, &planned)
 
 	scratch := filepath.Join(wtPath, "raced-wip.txt")
 	if err := os.WriteFile(scratch, []byte("wip\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	destroyed, skipped, err := executeDestroy(poolDir, []DestroyTarget{planned}, repoDir, defaultRef, true, DestroyOptions{})
+	resolveContext := fixedPruneContextResolver(pruneContext{RepoRoot: repoDir, DefaultRef: defaultRef})
+	destroyed, skipped, err := executeDestroy(poolDir, []DestroyTarget{planned}, resolveContext, true, DestroyOptions{})
 	if err != nil {
 		t.Fatalf("executeDestroy failed: %v", err)
 	}
@@ -844,25 +2133,29 @@ func TestExecuteDestroy_KeepsStateWhenRemovalFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadState failed: %v", err)
 	}
-	planned := classifyForDestroy(state.Worktrees[0], defaultRef)
-	measureDestroySize(&planned)
+	planned := classifyForDestroy(state.Worktrees[0], repoDir, defaultRef)
+	measureDestroySize(poolDir, &planned)
 
-	badRepoRoot := filepath.Join(t.TempDir(), "not-a-repo")
-	if err := os.MkdirAll(badRepoRoot, 0o755); err != nil {
+	bogusGitDir := filepath.Join(t.TempDir(), "not-git-metadata")
+	if err := os.MkdirAll(bogusGitDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	destroyed, skipped, err := executeDestroy(poolDir, []DestroyTarget{planned}, badRepoRoot, defaultRef, true, DestroyOptions{})
+	if err := os.WriteFile(filepath.Join(wtPath, ".git"), []byte("gitdir: "+bogusGitDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolveContext := fixedPruneContextResolver(pruneContext{RepoRoot: repoDir, DefaultRef: defaultRef})
+	destroyed, skipped, err := executeDestroy(poolDir, []DestroyTarget{planned}, resolveContext, true, DestroyOptions{IncludeUnlanded: true})
 	if err != nil {
 		t.Fatalf("executeDestroy failed: %v", err)
 	}
 	if len(destroyed) != 0 {
 		t.Fatalf("expected failed removal to skip, got destroyed %#v", destroyed)
 	}
-	if !hasDestroySkipFlags(skipped, wtPath, DestroyDisposable) {
+	if !hasDestroySkipFlags(skipped, wtPath, DestroyUnverified) {
 		t.Fatalf("expected failed removal skip without include flags, got %#v", skipped)
 	}
-	if !strings.Contains(skipped[0].Target.Detail, "git refused to remove worktree") {
-		t.Fatalf("expected git removal failure detail, got %#v", skipped)
+	if !strings.Contains(skipped[0].Target.Detail, "cannot resolve repository") {
+		t.Fatalf("expected removal failure detail, got %#v", skipped)
 	}
 	if _, err := os.Stat(wtPath); err != nil {
 		t.Fatalf("expected failed removal worktree to remain on disk: %v", err)
@@ -877,7 +2170,7 @@ func TestExecuteDestroy_KeepsStateWhenRemovalFails(t *testing.T) {
 	}
 }
 
-func TestExecuteDestroy_ReResolvesRepoRootWhenMissing(t *testing.T) {
+func TestExecuteDestroy_ResolvesRepoRootPerWorktree(t *testing.T) {
 	repoDir, poolDir := setupRepo(t)
 
 	wtPath := acquireDisposable(t, repoDir, poolDir)
@@ -889,10 +2182,11 @@ func TestExecuteDestroy_ReResolvesRepoRootWhenMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadState failed: %v", err)
 	}
-	planned := classifyForDestroy(state.Worktrees[0], defaultRef)
-	measureDestroySize(&planned)
+	planned := classifyForDestroy(state.Worktrees[0], repoDir, defaultRef)
+	measureDestroySize(poolDir, &planned)
 
-	destroyed, skipped, err := executeDestroy(poolDir, []DestroyTarget{planned}, "", defaultRef, true, DestroyOptions{})
+	resolveContext := fixedPruneContextResolver(pruneContext{RepoRoot: repoDir, DefaultRef: defaultRef})
+	destroyed, skipped, err := executeDestroy(poolDir, []DestroyTarget{planned}, resolveContext, true, DestroyOptions{})
 	if err != nil {
 		t.Fatalf("executeDestroy failed: %v", err)
 	}
@@ -939,14 +2233,12 @@ func TestExecuteDestroy_RemovalFailureRestoresOriginalOwnerReservation(t *testin
 	if original.OwnerPID == 0 || original.OwnerStartedAt == 0 {
 		t.Fatalf("expected acquired worktree to have owner reservation, got %#v", original)
 	}
-	planned := classifyForDestroy(original, defaultRef)
-	measureDestroySize(&planned)
+	planned := classifyForDestroy(original, repoDir, defaultRef)
+	measureDestroySize(poolDir, &planned)
 
-	badRepoRoot := filepath.Join(t.TempDir(), "not-a-repo")
-	if err := os.MkdirAll(badRepoRoot, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	destroyed, skipped, err := executeDestroy(poolDir, []DestroyTarget{planned}, badRepoRoot, defaultRef, true, DestroyOptions{IncludeInUse: true})
+	runGit(t, repoDir, "worktree", "lock", "--reason", "test removal refusal", wtPath)
+	resolveContext := fixedPruneContextResolver(pruneContext{RepoRoot: repoDir, DefaultRef: defaultRef})
+	destroyed, skipped, err := executeDestroy(poolDir, []DestroyTarget{planned}, resolveContext, true, DestroyOptions{IncludeInUse: true, IncludeUnlanded: true})
 	if err != nil {
 		t.Fatalf("executeDestroy failed: %v", err)
 	}
@@ -955,6 +2247,9 @@ func TestExecuteDestroy_RemovalFailureRestoresOriginalOwnerReservation(t *testin
 	}
 	if !hasDestroySkipFlags(skipped, wtPath, DestroyInUse) {
 		t.Fatalf("expected failed removal skip without include flags, got %#v", skipped)
+	}
+	if !strings.Contains(skipped[0].Target.Detail, "VCS refused to remove worktree") {
+		t.Fatalf("expected VCS removal refusal detail, got %#v", skipped)
 	}
 
 	state, err = ReadState(poolDir)
@@ -967,6 +2262,90 @@ func TestExecuteDestroy_RemovalFailureRestoresOriginalOwnerReservation(t *testin
 	if state.Worktrees[0].OwnerPID != original.OwnerPID || state.Worktrees[0].OwnerStartedAt != original.OwnerStartedAt {
 		t.Fatalf("expected original owner reservation restored, got %#v want pid=%d started=%d",
 			state.Worktrees[0], original.OwnerPID, original.OwnerStartedAt)
+	}
+}
+
+func TestDestroyPoolRemovesWorktreesOwnedByDifferentClones(t *testing.T) {
+	_, poolDir, worktreeA, worktreeB := acquireDisposableFromEachClone(t)
+
+	result, err := DestroyPool(poolDir, DestroyOptions{})
+	if err != nil {
+		t.Fatalf("DestroyPool failed: %v", err)
+	}
+	if len(result.Destroyed) != 2 || len(result.Skipped) != 0 {
+		t.Fatalf("expected both clone-owned worktrees destroyed, got destroyed=%#v skipped=%#v", result.Destroyed, result.Skipped)
+	}
+	for _, path := range []string{worktreeA, worktreeB} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("expected worktree %s removed, stat err: %v", path, err)
+		}
+	}
+}
+
+func TestWorktreePruneContextResolverKeepsRootWhenFetchFails(t *testing.T) {
+	repoA, poolDir, worktreeA, _ := acquireDisposableFromEachClone(t)
+	runGit(t, repoA, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "missing-origin"))
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry WorktreeEntry
+	for _, wt := range state.Worktrees {
+		if wt.Path == worktreeA {
+			entry = wt
+		}
+	}
+	wantRoot, err := resolvePoolRepoRoot(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resolveContext := worktreePruneContextResolver()
+	// The second call reads the cached failure and must keep the root too.
+	for i := 0; i < 2; i++ {
+		context, err := resolveContext(entry)
+		if err == nil {
+			t.Fatalf("call %d: expected fetch failure, got context %#v", i, context)
+		}
+		if context.RepoRoot != wantRoot || context.DefaultRef != "" {
+			t.Fatalf("call %d: expected root %q with empty default ref, got %#v", i, wantRoot, context)
+		}
+	}
+}
+
+func TestDestroyPoolRefusesUnattributableWorktreePerPath(t *testing.T) {
+	_, poolDir, attributable, unattributable := acquireDisposableFromEachClone(t)
+	bogusGitDir := filepath.Join(t.TempDir(), "not-git-metadata")
+	if err := os.MkdirAll(bogusGitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unattributable, ".git"), []byte("gitdir: "+bogusGitDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := DestroyPool(poolDir, DestroyOptions{IncludeUnlanded: true})
+	if err != nil {
+		t.Fatalf("DestroyPool failed: %v", err)
+	}
+	if len(result.Destroyed) != 1 || result.Destroyed[0].Path != attributable {
+		t.Fatalf("expected only attributable worktree %s destroyed, got %#v", attributable, result.Destroyed)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].Target.Path != unattributable {
+		t.Fatalf("expected unattributable worktree %s refused, got %#v", unattributable, result.Skipped)
+	}
+	detail := result.Skipped[0].Target.Detail
+	if !strings.Contains(detail, "cannot resolve repository") || !strings.Contains(detail, unattributable) {
+		t.Fatalf("expected refusal to name unattributable path, got %q", detail)
+	}
+	if _, err := os.Stat(unattributable); err != nil {
+		t.Fatalf("unattributable worktree was deleted: %v", err)
+	}
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Worktrees) != 1 || state.Worktrees[0].Path != unattributable {
+		t.Fatalf("expected only refused worktree to remain managed, got %#v", state.Worktrees)
 	}
 }
 
@@ -1147,6 +2526,61 @@ func TestPruneRemovesAvailableWorktree(t *testing.T) {
 	}
 	if len(state.Worktrees) != 0 {
 		t.Fatalf("expected pruned worktree to be removed from state, got %#v", state.Worktrees)
+	}
+}
+
+func TestPruneRemovesWorktreesOwnedByDifferentClones(t *testing.T) {
+	repoA, poolDir, worktreeA, worktreeB := acquireDisposableFromEachClone(t)
+
+	result, err := Prune(repoA, poolDir, false, nil)
+	if err != nil {
+		t.Fatalf("Prune failed: %v", err)
+	}
+	if len(result.Pruned) != 2 || len(result.Skipped) != 0 {
+		t.Fatalf("expected both clone-owned worktrees pruned, got pruned=%#v skipped=%#v", result.Pruned, result.Skipped)
+	}
+	for _, path := range []string{worktreeA, worktreeB} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("expected worktree %s removed, stat err: %v", path, err)
+		}
+	}
+}
+
+func TestPruneRemovesCleanIdleSquashMergedWorktree(t *testing.T) {
+	repoDir, poolDir := setupRepo(t)
+
+	wtPath, err := Acquire(repoDir, poolDir, 4, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	if err := Release(poolDir, wtPath); err != nil {
+		t.Fatalf("Release failed: %v", err)
+	}
+
+	runGit(t, wtPath, "checkout", "-b", "squashed-feature")
+	if err := os.WriteFile(filepath.Join(wtPath, "feature.txt"), []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, wtPath, "add", "feature.txt")
+	runGit(t, wtPath, "commit", "-m", "feature one")
+	if err := os.WriteFile(filepath.Join(wtPath, "feature.txt"), []byte("one\ntwo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, wtPath, "commit", "-am", "feature two")
+
+	runGit(t, repoDir, "merge", "--squash", "squashed-feature")
+	runGit(t, repoDir, "commit", "-m", "squash feature")
+	runGit(t, repoDir, "push", "origin", "main")
+
+	result, err := Prune(repoDir, poolDir, false, nil)
+	if err != nil {
+		t.Fatalf("Prune failed: %v", err)
+	}
+	if len(result.Pruned) != 1 || result.Pruned[0].Path != wtPath {
+		t.Fatalf("expected squash-merged worktree %s to be pruned, got %#v", wtPath, result.Pruned)
+	}
+	if _, err := os.Stat(wtPath); !os.IsNotExist(err) {
+		t.Fatalf("expected squash-merged worktree to be removed, stat err: %v", err)
 	}
 }
 
@@ -1493,8 +2927,8 @@ func TestPruneRefreshesOriginBeforeMergeSafety(t *testing.T) {
 	if len(result.Pruned) != 0 {
 		t.Fatalf("worktree with remotely unmerged HEAD must not be pruned, got %#v", result.Pruned)
 	}
-	if !hasSkippedReason(result.Skipped, wtPath, "not merged") {
-		t.Fatalf("expected unmerged worktree skip after fetch, got %#v", result.Skipped)
+	if !hasSkippedCategory(result.Skipped, wtPath, pruneSkipCannotVerify) {
+		t.Fatalf("expected cannot-verify worktree skip after fetch, got %#v", result.Skipped)
 	}
 	if _, err := os.Stat(wtPath); err != nil {
 		t.Fatalf("expected remotely unmerged worktree to remain: %v", err)
@@ -1534,8 +2968,8 @@ func TestPruneUsesRemoteTrackingDefaultRefNotShadowingBranch(t *testing.T) {
 	if len(result.Pruned) != 0 {
 		t.Fatalf("shadowed default ref must not prune unmerged worktree, got %#v", result.Pruned)
 	}
-	if !hasSkippedReason(result.Skipped, wtPath, "not merged") {
-		t.Fatalf("expected unmerged worktree skip with shadowed ref, got %#v", result.Skipped)
+	if !hasSkippedCategory(result.Skipped, wtPath, pruneSkipCannotVerify) {
+		t.Fatalf("expected cannot-verify worktree skip with shadowed ref, got %#v", result.Skipped)
 	}
 	if _, err := os.Stat(wtPath); err != nil {
 		t.Fatalf("expected shadowed-ref worktree to remain: %v", err)
@@ -1570,8 +3004,8 @@ func TestPruneUsesFullLocalDefaultRefWithoutOrigin(t *testing.T) {
 	if len(result.Pruned) != 0 {
 		t.Fatalf("local shadowed default ref must not prune unmerged worktree, got %#v", result.Pruned)
 	}
-	if !hasSkippedReason(result.Skipped, wtPath, "refs/heads/main") {
-		t.Fatalf("expected local default branch skip, got %#v", result.Skipped)
+	if !hasSkippedCategory(result.Skipped, wtPath, pruneSkipCannotVerify) {
+		t.Fatalf("expected cannot-verify local default branch skip, got %#v", result.Skipped)
 	}
 	if _, err := os.Stat(wtPath); err != nil {
 		t.Fatalf("expected local shadowed-ref worktree to remain: %v", err)
@@ -1606,8 +3040,8 @@ func TestPruneIgnoresStaleOriginHeadWhenOriginIsAbsent(t *testing.T) {
 	if len(result.Pruned) != 0 {
 		t.Fatalf("stale origin HEAD must not choose local main, got %#v", result.Pruned)
 	}
-	if !hasSkippedReason(result.Skipped, wtPath, "refs/heads/trunk") {
-		t.Fatalf("expected local HEAD branch skip, got %#v", result.Skipped)
+	if !hasSkippedCategory(result.Skipped, wtPath, pruneSkipCannotVerify) {
+		t.Fatalf("expected cannot-verify local HEAD branch skip, got %#v", result.Skipped)
 	}
 	if _, err := os.Stat(wtPath); err != nil {
 		t.Fatalf("expected stale origin HEAD worktree to remain: %v", err)
@@ -1702,7 +3136,7 @@ func TestRelease_RejectsDestroyingWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadState failed: %v", err)
 	}
-	if len(state.Worktrees) != 1 || state.Worktrees[0] != reserved {
+	if len(state.Worktrees) != 1 || !reflect.DeepEqual(state.Worktrees[0], reserved) {
 		t.Fatalf("expected destroy reservation to remain unchanged, got %#v", state.Worktrees)
 	}
 	if _, err := os.Stat(dirtyPath); err != nil {
@@ -1731,6 +3165,10 @@ func TestAcquireLease_MarksWorktreeLeasedInState(t *testing.T) {
 	wt := state.Worktrees[0]
 	if !wt.Leased || wt.LeaseHolder != "secondmate-home" {
 		t.Fatalf("expected durable lease with holder, got %#v", wt)
+	}
+	decodedID, err := hex.DecodeString(wt.LeaseID)
+	if err != nil || len(decodedID) != 16 {
+		t.Fatalf("expected 128-bit lease identity, got %q", wt.LeaseID)
 	}
 	// A lease must not depend on a live process: no owner reservation is kept.
 	if wt.OwnerPID != 0 || wt.OwnerStartedAt != 0 {
@@ -1820,7 +3258,7 @@ func TestRelease_ClearsLease(t *testing.T) {
 	if len(state.Worktrees) != 1 {
 		t.Fatalf("expected one worktree, got %#v", state.Worktrees)
 	}
-	if state.Worktrees[0].Leased || state.Worktrees[0].LeaseHolder != "" || !state.Worktrees[0].LeasedAt.IsZero() {
+	if state.Worktrees[0].Leased || state.Worktrees[0].LeaseID != "" || state.Worktrees[0].LeaseHolder != "" || !state.Worktrees[0].LeasedAt.IsZero() {
 		t.Fatalf("expected lease to be cleared, got %#v", state.Worktrees[0])
 	}
 	data, err := os.ReadFile(stateFilePath(poolDir))
@@ -1828,7 +3266,7 @@ func TestRelease_ClearsLease(t *testing.T) {
 		t.Fatalf("reading state file failed: %v", err)
 	}
 	stateJSON := string(data)
-	for _, field := range []string{`"leased"`, `"lease_holder"`, `"leased_at"`} {
+	for _, field := range []string{`"leased"`, `"lease_id"`, `"lease_holder"`, `"leased_at"`} {
 		if strings.Contains(stateJSON, field) {
 			t.Fatalf("expected cleared lease field %s to be omitted from state file:\n%s", field, stateJSON)
 		}
@@ -1841,6 +3279,39 @@ func TestRelease_ClearsLease(t *testing.T) {
 	}
 	if reused != wtPath {
 		t.Fatalf("expected released worktree %s to be reused, got %s", wtPath, reused)
+	}
+}
+
+func TestRelease_PreIdentityLeaseFailsConditionalAndAllowsLegacyReturn(t *testing.T) {
+	repoDir, poolDir := setupRepo(t)
+	lease, err := AcquireLeaseInfo(repoDir, poolDir, 4, nil, "legacy-holder")
+	if err != nil {
+		t.Fatalf("AcquireLeaseInfo failed: %v", err)
+	}
+
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Worktrees[0].LeaseID = ""
+	if err := WriteState(poolDir, state); err != nil {
+		t.Fatal(err)
+	}
+
+	err = ReleaseConditional(poolDir, lease.Path, "", ReleasePreconditions{ExpectedLeaseID: &lease.LeaseID}, nil)
+	if !errors.Is(err, ErrLeasePreconditionFailed) {
+		t.Fatalf("conditional release of pre-identity lease = %v, want precondition failure", err)
+	}
+	state, err = ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.Worktrees[0].Leased || state.Worktrees[0].LeaseID != "" {
+		t.Fatalf("conditional refusal mutated pre-identity lease: %#v", state.Worktrees[0])
+	}
+
+	if err := Release(poolDir, lease.Path); err != nil {
+		t.Fatalf("legacy unconditional release rejected pre-identity lease: %v", err)
 	}
 }
 
@@ -1864,6 +3335,9 @@ func TestList_ShowsLeasedState(t *testing.T) {
 	}
 	if statuses[0].LeaseHolder != "secondmate-7" {
 		t.Fatalf("expected lease holder to be reported, got %q", statuses[0].LeaseHolder)
+	}
+	if statuses[0].LeaseID == "" || statuses[0].LeasedAt.IsZero() {
+		t.Fatalf("expected lease identity and timestamp to be reported, got %#v", statuses[0])
 	}
 }
 
@@ -2023,6 +3497,69 @@ func TestAcquireLease_ConcurrentAcquiresNeverDoubleLease(t *testing.T) {
 		if !wt.Leased {
 			t.Fatalf("expected every concurrently acquired worktree to be leased, got %#v", wt)
 		}
+	}
+}
+
+func TestReleaseConditional_ConcurrentIdentityReleasesExactlyOnce(t *testing.T) {
+	repoDir, poolDir := setupLocalRepo(t)
+	lease, err := AcquireLeaseInfo(repoDir, poolDir, 1, nil, "automation-A")
+	if err != nil {
+		t.Fatalf("AcquireLeaseInfo failed: %v", err)
+	}
+
+	enteredBoundary := make(chan struct{})
+	allowReset := make(chan struct{})
+	secondStarted := make(chan struct{})
+	results := make(chan error, 2)
+	var preparationCalls atomic.Int32
+	preconditions := ReleasePreconditions{
+		ExpectedLeaseID:     &lease.LeaseID,
+		ExpectedLeaseHolder: &lease.LeaseHolder,
+	}
+	release := func() {
+		results <- ReleaseConditional(poolDir, lease.Path, "", preconditions, func() error {
+			if preparationCalls.Add(1) == 1 {
+				close(enteredBoundary)
+				<-allowReset
+			}
+			return nil
+		})
+	}
+
+	go release()
+	<-enteredBoundary
+	go func() {
+		close(secondStarted)
+		release()
+	}()
+	<-secondStarted
+	close(allowReset)
+
+	var succeeded, refused int
+	for range 2 {
+		err := <-results
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrLeasePreconditionFailed):
+			refused++
+		default:
+			t.Fatalf("unexpected concurrent release error: %v", err)
+		}
+	}
+	if succeeded != 1 || refused != 1 {
+		t.Fatalf("concurrent releases: succeeded=%d refused=%d, want exactly one each", succeeded, refused)
+	}
+	if preparationCalls.Load() != 1 {
+		t.Fatalf("release preparation ran %d times, want 1", preparationCalls.Load())
+	}
+
+	state, err := ReadState(poolDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Worktrees) != 1 || state.Worktrees[0].Leased {
+		t.Fatalf("expected lease released exactly once, got %#v", state.Worktrees)
 	}
 }
 
@@ -2212,4 +3749,939 @@ func TestHoldCwdProbe(t *testing.T) {
 func quoteForShell(p string) string {
 	// Double-quote works in both sh and cmd.exe for paths without quotes.
 	return `"` + p + `"`
+}
+
+// TestBackingRepositoryMissingJJ mirrors the git orphan detection for jj
+// slots: a pooled workspace whose .jj/repo pointer names a deleted store
+// must classify as orphaned, and one whose store exists must not. Pure file
+// fixtures: no jj binary required.
+func TestBackingRepositoryMissingJJ(t *testing.T) {
+	base := t.TempDir()
+	store := filepath.Join(base, "repo", ".jj", "repo")
+	if err := os.MkdirAll(store, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	slot := filepath.Join(base, "slot")
+	if err := os.MkdirAll(filepath.Join(slot, ".jj"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pointer := filepath.Join(slot, ".jj", "repo")
+	if err := os.WriteFile(pointer, []byte(store+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if missing, detail := backingRepositoryMissing(slot); missing {
+		t.Fatalf("store exists; expected not orphaned, got %q", detail)
+	}
+
+	if err := os.RemoveAll(filepath.Join(base, "repo")); err != nil {
+		t.Fatal(err)
+	}
+	missing, detail := backingRepositoryMissing(slot)
+	if !missing {
+		t.Fatal("store deleted; expected the slot to classify as orphaned")
+	}
+	if !strings.Contains(detail, "jj store") {
+		t.Fatalf("detail should name the jj store, got %q", detail)
+	}
+
+	// A jj slot with a corrupt (empty) store pointer cannot classify as an
+	// orphan, and the diagnostic must name the jj pointer problem rather than
+	// the absent .git entry.
+	corrupt := filepath.Join(base, "corrupt")
+	if err := os.MkdirAll(filepath.Join(corrupt, ".jj"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(corrupt, ".jj", "repo"), []byte("\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	missing, detail = backingRepositoryMissing(corrupt)
+	if missing {
+		t.Fatal("a corrupt pointer must not classify as orphaned")
+	}
+	if !strings.Contains(detail, filepath.Join(".jj", "repo")) {
+		t.Fatalf("detail should name the jj store pointer, got %q", detail)
+	}
+
+	// A main workspace (.jj/repo is the store directory itself) is not a
+	// linked worktree and must never classify as orphaned.
+	if missing, _ := backingRepositoryMissing(filepath.Join(base, "mainws")); missing {
+		t.Fatal("nonexistent path must not classify as orphaned")
+	}
+	mainws := filepath.Join(base, "mainws", ".jj", "repo")
+	if err := os.MkdirAll(mainws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if missing, _ := backingRepositoryMissing(filepath.Join(base, "mainws")); missing {
+		t.Fatal("a main workspace must not classify as orphaned")
+	}
+}
+
+// TestAcquire_SkipsMarkerlessSlot pins the fail-closed contract for damaged
+// slots: a pool entry whose .git/.jj marker is gone must never be admitted to
+// reuse. Dispatching on a markerless path falls back to the configured
+// backend, which in an in-project pool resolves the repository ENCLOSING the
+// pool, so the safety checks would vouch for that repository and the reset
+// would rewrite it - deleting untracked files or moving its checkout.
+func TestAcquire_SkipsMarkerlessSlot(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+
+	wtPath, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+
+	// Damage the slot: its .git marker disappears.
+	if err := os.Remove(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+	// Untracked work in the enclosing repository that a misdirected reset
+	// would delete, and the checkout position it would move.
+	precious := filepath.Join(repoDir, "untracked.txt")
+	if err := os.WriteFile(precious, []byte("precious\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	headBefore := gitOut(t, repoDir, "rev-parse", "HEAD")
+
+	second, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire should create a fresh slot instead: %v", err)
+	}
+	if second == wtPath {
+		t.Fatal("acquire admitted a markerless slot to reuse")
+	}
+	if _, err := os.Stat(precious); err != nil {
+		t.Fatalf("untracked file in the enclosing repository must survive: %v", err)
+	}
+	if headAfter := gitOut(t, repoDir, "rev-parse", "HEAD"); headAfter != headBefore {
+		t.Fatalf("enclosing repository checkout moved: %s -> %s", headBefore, headAfter)
+	}
+}
+
+// TestAcquire_MarkerlessSlotSelfIgnoringPool reproduces the reviewed failure
+// exactly as production reaches it. `treehouse get` writes a self-ignoring
+// .gitignore into the pool root, so the enclosing repository reports itself
+// clean and the fallback dirty check cannot accidentally shield the damaged
+// slot. Before the fail-closed guard, acquire admitted the markerless slot to
+// reuse and ResetWorktreeToRef committed a raw commit ID onto the enclosing
+// repository's HEAD, detaching its checkout off the default branch.
+func TestAcquire_MarkerlessSlotSelfIgnoringPool(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+	if err := os.MkdirAll(poolDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(poolDir, ".gitignore"), []byte("*\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wtPath, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+	if err := os.Remove(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+	headBefore := gitOut(t, repoDir, "rev-parse", "HEAD")
+
+	second, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire should create a fresh slot instead: %v", err)
+	}
+	if second == wtPath {
+		t.Fatal("acquire admitted a markerless slot to reuse")
+	}
+	if headAfter := gitOut(t, repoDir, "rev-parse", "HEAD"); headAfter != headBefore {
+		t.Fatalf("enclosing repository checkout moved: %s -> %s", headBefore, headAfter)
+	}
+	if ref := gitOut(t, repoDir, "rev-parse", "--abbrev-ref", "HEAD"); ref != "main" {
+		t.Fatalf("enclosing repository HEAD detached off main to %q", ref)
+	}
+}
+
+// TestRelease_MarkerlessSlotClearsLeaseWithoutReset pins the release side of
+// the same contract: returning a slot whose .git/.jj marker is gone must clear
+// its lease without dispatching branch discovery or a reset, which would fall
+// back to the configured backend and rewrite the repository ENCLOSING an
+// in-project pool.
+func TestRelease_MarkerlessSlotClearsLeaseWithoutReset(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+
+	lease, err := AcquireLeaseInfo(repoDir, poolDir, 2, nil, "holder")
+	if err != nil {
+		t.Fatalf("AcquireLeaseInfo failed: %v", err)
+	}
+	if err := os.Remove(filepath.Join(lease.Path, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+	precious := filepath.Join(repoDir, "untracked.txt")
+	if err := os.WriteFile(precious, []byte("precious\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	headBefore := gitOut(t, repoDir, "rev-parse", "HEAD")
+
+	if err := Release(poolDir, lease.Path); err != nil {
+		t.Fatalf("Release failed: %v", err)
+	}
+
+	entry, err := FindByPath(poolDir, lease.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil {
+		t.Fatal("released slot must stay managed")
+	}
+	if entry.Leased {
+		t.Fatal("release must clear the lease on a markerless slot")
+	}
+	if _, err := os.Stat(precious); err != nil {
+		t.Fatalf("untracked file in the enclosing repository must survive: %v", err)
+	}
+	if headAfter := gitOut(t, repoDir, "rev-parse", "HEAD"); headAfter != headBefore {
+		t.Fatalf("enclosing repository checkout moved: %s -> %s", headBefore, headAfter)
+	}
+	if ref := gitOut(t, repoDir, "rev-parse", "--abbrev-ref", "HEAD"); ref != "main" {
+		t.Fatalf("enclosing repository HEAD moved off main to %q", ref)
+	}
+}
+
+// TestDestroyWorktree_MarkerlessSlot pins destroy's side of the remediation
+// story: a slot whose .git/.jj marker is gone classifies as unverified (its
+// facts are never read from the repository enclosing the pool) and is actually
+// removable with --include-unlanded through the plain-directory route, freeing
+// its max_trees seat; the stale VCS registration self-heals at the next add.
+func TestDestroyWorktree_MarkerlessSlot(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+	if err := os.Remove(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+	precious := filepath.Join(repoDir, "untracked.txt")
+	if err := os.WriteFile(precious, []byte("precious\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dryRun, err := DestroyWorktree(poolDir, wtPath, DestroyOptions{DryRun: true})
+	if err != nil {
+		t.Fatalf("DestroyWorktree dry run failed: %v", err)
+	}
+	if len(dryRun.Planned) != 0 || len(dryRun.Skipped) != 1 {
+		t.Fatalf("expected one skip and no planned targets, got %+v", dryRun)
+	}
+	if got := dryRun.Skipped[0].Target.Class; got != DestroyUnverified {
+		t.Fatalf("expected class %q, got %q", DestroyUnverified, got)
+	}
+	if got := dryRun.Skipped[0].NeededFlag; got != IncludeUnlandedFlag {
+		t.Fatalf("expected needed flag %q, got %q", IncludeUnlandedFlag, got)
+	}
+
+	result, err := DestroyWorktree(poolDir, wtPath, DestroyOptions{IncludeUnlanded: true})
+	if err != nil {
+		t.Fatalf("DestroyWorktree failed: %v", err)
+	}
+	if len(result.Destroyed) != 1 {
+		t.Fatalf("expected the markerless slot removed, got %+v", result)
+	}
+	if _, err := os.Stat(wtPath); !os.IsNotExist(err) {
+		t.Fatalf("expected worktree directory removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(precious); err != nil {
+		t.Fatalf("untracked file in the enclosing repository must survive: %v", err)
+	}
+
+	// The freed seat is usable again: the stale git registration self-heals
+	// at the next add.
+	if _, err := Acquire(repoDir, poolDir, 1, nil); err != nil {
+		t.Fatalf("Acquire after destroying the markerless slot failed: %v", err)
+	}
+}
+
+func TestDestroyWorktree_MarkerlessSlotDoesNotFetchEnclosingRepo(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+
+	wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+	if err := os.Remove(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+
+	localOriginHead := gitOut(t, repoDir, "rev-parse", "refs/remotes/origin/main")
+	updater := filepath.Join(filepath.Dir(repoDir), "updater")
+	runGit(t, "", "clone", filepath.Join(filepath.Dir(repoDir), "remote.git"), updater)
+	runGit(t, updater, "config", "user.email", "test@test.com")
+	runGit(t, updater, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(updater, "remote.txt"), []byte("new remote commit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, updater, "add", "remote.txt")
+	runGit(t, updater, "commit", "-m", "advance remote")
+	runGit(t, updater, "push", "origin", "main")
+	remoteHead := gitOut(t, updater, "rev-parse", "HEAD")
+	if remoteHead == localOriginHead {
+		t.Fatal("test setup did not advance the remote")
+	}
+
+	result, err := DestroyWorktree(poolDir, wtPath, DestroyOptions{IncludeUnlanded: true})
+	if err != nil {
+		t.Fatalf("DestroyWorktree failed: %v", err)
+	}
+	if len(result.Destroyed) != 1 || len(result.Skipped) != 0 {
+		t.Fatalf("expected markerless slot to be destroyed, got %+v", result)
+	}
+	if got := gitOut(t, repoDir, "rev-parse", "refs/remotes/origin/main"); got != localOriginHead {
+		t.Fatalf("markerless destroy fetched the enclosing repository: origin/main moved %s -> %s", localOriginHead, got)
+	}
+}
+
+// TestList_MarkerlessSlotReportsDamaged pins status's side of the contract: an
+// idle slot whose .git/.jj marker is gone is reported with its own damaged
+// status, never with dirtiness read from the repository enclosing an
+// in-project pool (which would label the slot available or dirty from someone
+// else's facts).
+func TestList_MarkerlessSlotReportsDamaged(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+
+	wtPath, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+	if err := os.Remove(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "untracked.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses, err := List(poolDir)
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected one worktree, got %+v", statuses)
+	}
+	if statuses[0].Status != StatusDamaged {
+		t.Fatalf("expected status %q, got %q", StatusDamaged, statuses[0].Status)
+	}
+	if statuses[0].Flavor != "" {
+		t.Fatalf("expected empty flavor for a markerless slot, got %q", statuses[0].Flavor)
+	}
+}
+
+// TestList_MarkerlessSlotDoesNotInheritEnclosingBranch pins the P1-1 boundary
+// at the status surface: a damaged slot inside an in-project pool reports no
+// branch, never the branch of the repository enclosing the pool. The enclosing
+// repository is moved to a distinctive branch so the assertion cannot pass by
+// accident.
+func TestList_MarkerlessSlotDoesNotInheritEnclosingBranch(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+
+	wtPath, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+	runGit(t, repoDir, "checkout", "-b", "do-not-inherit")
+	if err := os.Remove(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+
+	statuses, err := List(poolDir)
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected one worktree, got %+v", statuses)
+	}
+	if statuses[0].Status != StatusDamaged {
+		t.Fatalf("expected status %q, got %q", StatusDamaged, statuses[0].Status)
+	}
+	if statuses[0].Branch != "" {
+		t.Fatalf("markerless slot inherited enclosing branch %q", statuses[0].Branch)
+	}
+	if statuses[0].Detached {
+		t.Fatalf("markerless slot must not be reported detached")
+	}
+}
+
+// TestList_UnreadableMarkerReportsBranchError pins the P1-2 boundary at the
+// status surface: a damaged slot whose marker exists but cannot be read is a
+// genuine read failure, reported as `branch_error`, never mistaken for a
+// markerless slot. A self-referential symlink forces the stat failure
+// deterministically, independently of the running user's privileges.
+func TestList_UnreadableMarkerReportsBranchError(t *testing.T) {
+	repoDir, poolDir := setupRepo(t)
+
+	wtPath, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+	if err := os.RemoveAll(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+	if err := os.Symlink(".git", filepath.Join(wtPath, ".git")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	statuses, err := List(poolDir)
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected one worktree, got %+v", statuses)
+	}
+	if statuses[0].Status != StatusDamaged {
+		t.Fatalf("expected status %q, got %q", StatusDamaged, statuses[0].Status)
+	}
+	if statuses[0].Branch != "" || statuses[0].Detached {
+		t.Fatalf("unreadable-marker slot must not report a branch or detached, got branch %q detached=%v", statuses[0].Branch, statuses[0].Detached)
+	}
+	if statuses[0].BranchErr == "" {
+		t.Fatal("unreadable marker must report a branch error, not collapse into the markerless empty answer")
+	}
+}
+
+// TestList_ReportsBranchAndDetached pins the healthy cases: a detached slot
+// (what `treehouse get` leaves) is reported detached with no branch error, and
+// a slot on a branch reports that branch. Neither may be misclassified.
+func TestList_ReportsBranchAndDetached(t *testing.T) {
+	repoDir, poolDir := setupRepo(t)
+
+	wtPath, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+
+	statuses, err := List(poolDir)
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected one worktree, got %+v", statuses)
+	}
+	if statuses[0].Branch != "" || !statuses[0].Detached {
+		t.Fatalf("freshly acquired slot: got branch %q detached=%v, want empty and detached", statuses[0].Branch, statuses[0].Detached)
+	}
+	if statuses[0].BranchErr != "" {
+		t.Fatalf("a healthy detached slot must not report a branch error: %q", statuses[0].BranchErr)
+	}
+
+	runGit(t, wtPath, "switch", "-c", "slot-branch")
+
+	statuses, err = List(poolDir)
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if statuses[0].Branch != "slot-branch" {
+		t.Fatalf("slot on a branch: got %q, want %q", statuses[0].Branch, "slot-branch")
+	}
+	if statuses[0].Detached {
+		t.Fatalf("slot on a branch must not be reported detached")
+	}
+	if statuses[0].BranchErr != "" {
+		t.Fatalf("slot on a branch must not report a branch error: %q", statuses[0].BranchErr)
+	}
+}
+
+// TestPrune_MarkerlessSlotSkippedAsCannotVerify pins prune's classification:
+// a slot whose .git/.jj marker is gone is reported as cannot-verify - the
+// enclosing repository's facts must not decide whether it is deletable - and
+// is left on disk.
+func TestPrune_MarkerlessSlotSkippedAsCannotVerify(t *testing.T) {
+	repoDir, _ := setupRepo(t)
+	poolDir := filepath.Join(repoDir, "pool") // in-project pool root
+
+	wtPath, err := Acquire(repoDir, poolDir, 2, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+	if err := os.Remove(filepath.Join(wtPath, ".git")); err != nil {
+		t.Fatalf("removing the slot marker: %v", err)
+	}
+
+	result, err := Prune(repoDir, poolDir, false, nil)
+	if err != nil {
+		t.Fatalf("Prune failed: %v", err)
+	}
+	if len(result.Pruned) != 0 || len(result.Candidates) != 0 {
+		t.Fatalf("prune must not touch a markerless slot, got %+v", result)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].Category != pruneSkipCannotVerify {
+		t.Fatalf("expected one cannot-verify skip, got %+v", result.Skipped)
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Fatalf("markerless slot must stay on disk: %v", err)
+	}
+}
+
+// TestValidateReleasePreconditions_GuardsTheActionUnderTheStateLock covers the
+// takeover window get's exit path used to leave open. It checked that it still
+// owned the slot, released the state lock, and only then detached the worktree,
+// so a `treehouse lease` landing in between moved the HEAD of a home the fresh
+// lease was there to protect. The guarded action must therefore both be skipped
+// when the slot has been taken over, and run inside the same lock as the check
+// so no other state writer can slip between them.
+func TestValidateReleasePreconditions_GuardsTheActionUnderTheStateLock(t *testing.T) {
+	poolDir := t.TempDir()
+	owned := WorktreeEntry{Name: "1", Path: filepath.Join(poolDir, "1", "myrepo")}
+	setSeedInventory(&owned, []string{}, true)
+	if err := reserveOwner(&owned); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteState(poolDir, State{Worktrees: []WorktreeEntry{owned}}); err != nil {
+		t.Fatal(err)
+	}
+	ownReservation := ReleasePreconditions{RequireOwnedByCaller: true}
+
+	takeoverDone := make(chan struct{})
+	interleaved := false
+	err := ValidateReleasePreconditions(poolDir, owned.Path, ownReservation, func() error {
+		// Stands in for the concurrent `treehouse lease`: any other writer of
+		// this pool's state must wait until the guarded action has finished.
+		go func() {
+			defer close(takeoverDone)
+			WithStateLock(poolDir, func() error { return nil })
+		}()
+		select {
+		case <-takeoverDone:
+			interleaved = true
+		case <-time.After(200 * time.Millisecond):
+		}
+		return nil
+	})
+	<-takeoverDone
+	if err != nil {
+		t.Fatalf("owned worktree rejected its own reservation: %v", err)
+	}
+	if interleaved {
+		t.Fatal("a concurrent state writer ran while the guarded action was in flight; the check and the action are not one locked step")
+	}
+
+	// The slot is now durably leased, as `treehouse lease` leaves it: the lease
+	// clears the owner reservation, so this is exactly what the exiting get
+	// sees. The guarded action must not touch it.
+	leased := owned
+	leased.OwnerPID = 0
+	leased.OwnerStartedAt = 0
+	leased.Leased = true
+	leased.LeaseHolder = "live-home"
+	leased.LeasedAt = time.Now().UTC()
+	if err := WriteState(poolDir, State{Worktrees: []WorktreeEntry{leased}}); err != nil {
+		t.Fatal(err)
+	}
+
+	ran := false
+	err = ValidateReleasePreconditions(poolDir, leased.Path, ownReservation, func() error {
+		ran = true
+		return nil
+	})
+	if !errors.Is(err, ErrOwnerPreconditionFailed) {
+		t.Fatalf("expected the leased slot to fail the owner precondition, got %v", err)
+	}
+	if ran {
+		t.Fatal("the guarded action ran on a slot a durable lease had taken over")
+	}
+}
+
+// status must show what return would act on. The raw scan answers with the
+// caller's own process tree whenever status runs from inside a pooled
+// worktree, so the column reported the invoking shell and the status process
+// itself as processes attached to the slot - a set return would never target.
+func TestList_ReportsOnlyProcessesReturnWouldTerminate(t *testing.T) {
+	repoDir, poolDir := setupRepo(t)
+
+	wtPath, err := Acquire(repoDir, poolDir, 4, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+
+	caller := process.ProcessInfo{PID: 200, Name: "treehouse"}
+	foreign := process.ProcessInfo{PID: 4321, Name: "agent"}
+	restore := swapListProcessSeams(
+		func(string) ([]process.ProcessInfo, error) {
+			return []process.ProcessInfo{caller, foreign}, nil
+		},
+		func(procs []process.ProcessInfo) ([]process.ProcessInfo, error) {
+			return []process.ProcessInfo{procs[1]}, nil
+		},
+	)
+	t.Cleanup(restore)
+
+	statuses, err := List(poolDir)
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected one worktree, got %#v", statuses)
+	}
+	if len(statuses[0].Processes) != 1 || statuses[0].Processes[0] != foreign {
+		t.Fatalf("expected only the unprotected process to be reported, got %#v", statuses[0].Processes)
+	}
+	if statuses[0].Status != StatusInUse {
+		t.Fatalf("expected a slot with a foreign process to read in-use, got %q", statuses[0].Status)
+	}
+}
+
+// An ancestry-lookup failure must not read as a quiet slot: "is anything still
+// running here?" is the one question this column answers, and a wrong "no" is
+// worse than a line the caller has to interpret.
+func TestList_FallsBackToRawScanWhenFilteringFails(t *testing.T) {
+	repoDir, poolDir := setupRepo(t)
+
+	wtPath, err := Acquire(repoDir, poolDir, 4, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+
+	unfiltered := process.ProcessInfo{PID: 4321, Name: "agent"}
+	restore := swapListProcessSeams(
+		func(string) ([]process.ProcessInfo, error) {
+			return []process.ProcessInfo{unfiltered}, nil
+		},
+		func([]process.ProcessInfo) ([]process.ProcessInfo, error) {
+			return nil, errors.New("cannot resolve ancestry of process 200")
+		},
+	)
+	t.Cleanup(restore)
+
+	statuses, err := List(poolDir)
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected one worktree, got %#v", statuses)
+	}
+	if len(statuses[0].Processes) != 1 || statuses[0].Processes[0] != unfiltered {
+		t.Fatalf("expected the raw scan to stand in when filtering fails, got %#v", statuses[0].Processes)
+	}
+	if statuses[0].Status != StatusInUse {
+		t.Fatalf("expected a slot with an unfiltered process to read in-use, got %q", statuses[0].Status)
+	}
+}
+
+// A process table that cannot be read is a different failure from an ancestry
+// walk that cannot be completed: there is no list to fall back to, so the slot
+// must not quietly present as available. It reads unverified (so status --json
+// carries the fact too), warns on stderr, and never re-runs the scan that just
+// failed.
+func TestList_ReportsUnverifiedWhenTheProcessTableCannotBeRead(t *testing.T) {
+	repoDir, poolDir := setupRepo(t)
+
+	wtPath, err := Acquire(repoDir, poolDir, 4, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+
+	scans := 0
+	restore := swapListProcessSeams(
+		func(string) ([]process.ProcessInfo, error) {
+			scans++
+			return nil, errors.New("cannot read the process table")
+		},
+		func([]process.ProcessInfo) ([]process.ProcessInfo, error) {
+			t.Error("List must not filter a scan that failed")
+			return nil, nil
+		},
+	)
+	t.Cleanup(restore)
+
+	var statuses []WorktreeStatus
+	stderr := captureStderr(t, func() {
+		statuses, err = List(poolDir)
+	})
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if scans != 1 {
+		t.Fatalf("expected the failing scan to run once, ran %d times", scans)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected one worktree, got %#v", statuses)
+	}
+	if len(statuses[0].Processes) != 0 {
+		t.Fatalf("expected no processes when the scan failed, got %#v", statuses[0].Processes)
+	}
+	if statuses[0].Status != StatusUnverified {
+		t.Fatalf("expected %q when the scan failed, got %q", StatusUnverified, statuses[0].Status)
+	}
+	if !strings.Contains(stderr, "WARNING") || !strings.Contains(stderr, wtPath) {
+		t.Fatalf("expected a warning naming %s, got stderr %q", wtPath, stderr)
+	}
+}
+
+// Unverified stands in only for what the process list would have decided. A
+// lease, a live owner reservation, and the caller's own cwd are known without
+// a scan, and a failed scan must not hide them.
+func TestList_KnownFactsOutrankUnverified(t *testing.T) {
+	restore := swapListProcessSeams(
+		func(string) ([]process.ProcessInfo, error) {
+			return nil, errors.New("cannot read the process table")
+		},
+		func([]process.ProcessInfo) ([]process.ProcessInfo, error) {
+			t.Error("List must not filter a scan that failed")
+			return nil, nil
+		},
+	)
+	t.Cleanup(restore)
+
+	t.Run("leased", func(t *testing.T) {
+		repoDir, poolDir := setupRepo(t)
+		if _, err := AcquireLease(repoDir, poolDir, 4, nil, "home"); err != nil {
+			t.Fatalf("AcquireLease failed: %v", err)
+		}
+		assertSingleStatus(t, poolDir, StatusLeased)
+	})
+
+	t.Run("owner reservation", func(t *testing.T) {
+		repoDir, poolDir := setupRepo(t)
+		// Acquire leaves this test process's own reservation in place.
+		if _, err := Acquire(repoDir, poolDir, 4, nil); err != nil {
+			t.Fatalf("Acquire failed: %v", err)
+		}
+		assertSingleStatus(t, poolDir, StatusInUse)
+	})
+
+	t.Run("you're here", func(t *testing.T) {
+		repoDir, poolDir := setupRepo(t)
+		wtPath, err := Acquire(repoDir, poolDir, 4, nil)
+		if err != nil {
+			t.Fatalf("Acquire failed: %v", err)
+		}
+		clearOwnerReservation(t, poolDir, wtPath)
+		t.Chdir(wtPath)
+		assertSingleStatus(t, poolDir, StatusHere)
+	})
+}
+
+func assertSingleStatus(t *testing.T, poolDir, want string) {
+	t.Helper()
+	var statuses []WorktreeStatus
+	var err error
+	captureStderr(t, func() {
+		statuses, err = List(poolDir)
+	})
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected one worktree, got %#v", statuses)
+	}
+	if statuses[0].Status != want {
+		t.Fatalf("expected %q, got %q", want, statuses[0].Status)
+	}
+}
+
+// "you're here" used to be read from the caller's own shell turning up in the
+// scan. With that entry filtered out it must come from the cwd itself, or
+// standing in a slot would stop reporting it.
+func TestList_ReportsYoureHereWithoutACallerProcess(t *testing.T) {
+	repoDir, poolDir := setupRepo(t)
+
+	wtPath, err := Acquire(repoDir, poolDir, 4, nil)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	clearOwnerReservation(t, poolDir, wtPath)
+
+	restore := swapListProcessSeams(
+		func(string) ([]process.ProcessInfo, error) { return nil, nil },
+		func([]process.ProcessInfo) ([]process.ProcessInfo, error) { return nil, nil },
+	)
+	t.Cleanup(restore)
+
+	// setupRepo resolves symlinks, so this is the path List will compare against.
+	t.Chdir(wtPath)
+
+	statuses, err := List(poolDir)
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected one worktree, got %#v", statuses)
+	}
+	if statuses[0].Status != StatusHere {
+		t.Fatalf("expected %q for the slot the caller is standing in, got %q", StatusHere, statuses[0].Status)
+	}
+	if len(statuses[0].Processes) != 0 {
+		t.Fatalf("expected no processes to be attributed to the slot, got %#v", statuses[0].Processes)
+	}
+}
+
+// A pool rooted under a symlink (root = "/tmp/th" on macOS, say) records the
+// unresolved path in state while the caller's shell reports the physical one,
+// so "you're here" has to resolve both sides. Nothing else reports the caller
+// standing in the slot: enter takes no owner reservation and no lease, and the
+// caller's own process is deliberately filtered out of the process list.
+func TestList_ReportsYoureHereThroughASymlinkedPoolPath(t *testing.T) {
+	base := t.TempDir()
+	base, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	poolDir := filepath.Join(base, "pool")
+	physicalSlot := filepath.Join(base, "slots", "1", "repo")
+	for _, dir := range []string{poolDir, physicalSlot} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A real marker, so the slot is an ordinary healthy one. A markerless
+	// directory is a DAMAGED slot, which List reports as such wherever the
+	// caller stands, and this test would then assert nothing about the cwd.
+	runGit(t, physicalSlot, "init", "--initial-branch=main")
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(filepath.Join(base, "slots"), link); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	symlinkedSlot := filepath.Join(link, "1", "repo")
+
+	entry := WorktreeEntry{Name: "1", Path: symlinkedSlot}
+	setSeedInventory(&entry, nil, true)
+	if err := WriteState(poolDir, State{Worktrees: []WorktreeEntry{entry}}); err != nil {
+		t.Fatal(err)
+	}
+
+	restore := swapListProcessSeams(
+		func(string) ([]process.ProcessInfo, error) { return nil, nil },
+		func([]process.ProcessInfo) ([]process.ProcessInfo, error) { return nil, nil },
+	)
+	t.Cleanup(restore)
+
+	t.Chdir(physicalSlot)
+
+	statuses, err := List(poolDir)
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected one worktree, got %#v", statuses)
+	}
+	if statuses[0].Status != StatusHere {
+		t.Fatalf("expected %q for a slot reached through a symlink, got %q", StatusHere, statuses[0].Status)
+	}
+}
+
+func swapListProcessSeams(
+	scan func(string) ([]process.ProcessInfo, error),
+	filter func([]process.ProcessInfo) ([]process.ProcessInfo, error),
+) func() {
+	origScan, origFilter := findProcessesInWorktree, dropProtectedProcesses
+	findProcessesInWorktree = scan
+	dropProtectedProcesses = filter
+	return func() {
+		findProcessesInWorktree = origScan
+		dropProtectedProcesses = origFilter
+	}
+}
+
+// captureStderr collects what f writes to os.Stderr, which is where this
+// package's loud warnings go.
+func captureStderr(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+
+	done := make(chan string, 1)
+	go func() {
+		var sb strings.Builder
+		_, _ = io.Copy(&sb, r)
+		done <- sb.String()
+	}()
+
+	f()
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out := <-done
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestReleasePreconditions_LeaseIdentityAndAbsenceAreSeparatePredicates pins the
+// split between "still exactly this acquisition" and "still nobody's". They are
+// opposite assertions, so neither an empty identity nor the two together can
+// describe a reachable worktree: both are refused as a CALL-SITE error, with a
+// sentinel a release classifier must never mistake for a lease state, and
+// nothing about the worktree changes.
+func TestReleasePreconditions_LeaseIdentityAndAbsenceAreSeparatePredicates(t *testing.T) {
+	repoDir, poolDir := setupRepo(t)
+	lease, err := AcquireLeaseInfo(repoDir, poolDir, 4, nil, "holder-A")
+	if err != nil {
+		t.Fatalf("AcquireLeaseInfo failed: %v", err)
+	}
+
+	empty := ""
+	holder := lease.LeaseHolder
+	refused := []struct {
+		name          string
+		preconditions ReleasePreconditions
+	}{
+		{"empty identity is not a lease", ReleasePreconditions{ExpectedLeaseID: &empty}},
+		{"identity and absence together", ReleasePreconditions{ExpectedLeaseID: &lease.LeaseID, RequireUnleased: true}},
+		{"holder and absence together", ReleasePreconditions{ExpectedLeaseHolder: &holder, RequireUnleased: true}},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ReleaseConditional(poolDir, lease.Path, "", tc.preconditions, nil)
+			if !errors.Is(err, ErrInvalidReleasePreconditions) {
+				t.Fatalf("release = %v, want ErrInvalidReleasePreconditions", err)
+			}
+			if errors.Is(err, ErrLeasePreconditionFailed) {
+				t.Fatalf("a call-site error must not read as a lease state: %v", err)
+			}
+			state, err := ReadState(poolDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !state.Worktrees[0].Leased || state.Worktrees[0].LeaseID != lease.LeaseID {
+				t.Fatalf("a refused call mutated the lease: %#v", state.Worktrees[0])
+			}
+		})
+	}
+
+	// Each predicate then refuses exactly the state it is meant to refuse.
+	if err := ReleaseConditional(poolDir, lease.Path, "", ReleasePreconditions{RequireUnleased: true}, nil); !errors.Is(err, ErrLeasePreconditionFailed) {
+		t.Fatalf("RequireUnleased on a leased worktree = %v, want a lease precondition failure", err)
+	}
+	stale := "not-the-current-identity"
+	if err := ReleaseConditional(poolDir, lease.Path, "", ReleasePreconditions{ExpectedLeaseID: &stale}, nil); !errors.Is(err, ErrLeasePreconditionFailed) {
+		t.Fatalf("a stale identity = %v, want a lease precondition failure", err)
+	}
+	if err := ReleaseConditional(poolDir, lease.Path, "", ReleasePreconditions{ExpectedLeaseID: &lease.LeaseID}, nil); err != nil {
+		t.Fatalf("the current identity must still release: %v", err)
+	}
+	if err := ReleaseConditional(poolDir, lease.Path, "", ReleasePreconditions{RequireUnleased: true}, nil); err != nil {
+		t.Fatalf("RequireUnleased on the now-parked worktree must pass: %v", err)
+	}
 }

@@ -5,9 +5,74 @@
 # Maximum number of worktrees in the pool
 max_trees = 16
 
-# Lifecycle hooks are ignored in repo-level config for safety.
-# Each list runs sequentially in the worktree directory via the OS shell.
-# Failures are logged and do not fail the operation.
-# [hooks]
-# post_create = ["./scripts/setup-venv.sh"]
-# pre_destroy = ["./scripts/teardown.sh"]
+# Optional worktree root directory.
+# Empty (default) uses the global $HOME/.treehouse store.
+# Relative paths resolve from the repo root; "treehouse" is always appended.
+# Override per-command with the --root flag or the TREEHOUSE_ROOT env var
+# (precedence: --root > TREEHOUSE_ROOT > this file > user config > default).
+# Set to "." to keep the pool in-project at <repo>/.treehouse/, next to the
+# code and removed with the project.
+# root = "."
+
+# Optional base branch: the branch new and recycled worktrees are cut from.
+# Unset (default) infers it from the repository, unchanged from before:
+# origin/HEAD, then the checked-out branch, then init.defaultBranch.
+# When set, the branch must exist locally or on origin -- treehouse fails
+# closed instead of quietly falling back to the inferred default.
+# Whichever of <branch> and origin/<branch> is further ahead wins, preferring
+# origin when they have diverged, exactly as the inferred default behaves.
+# Override per-command with the --base flag.
+# base_branch = "develop"
+
+# Optional unique worktree directory names.
+# Each pool slot normally lives in a directory named after the repository
+# (<pool>/<slot>/<repo>), so tooling that derives per-checkout identity from
+# the working directory's last path segment -- test-database names, container
+# names, cache keys -- reads every slot as the same checkout.
+# Set true to name new slots <repo>-<slot> instead.
+# Off (default) keeps the current layout; worktrees already in the pool keep
+# their paths either way, so turning this on never moves or renames one.
+# Override per-command with the --unique-leaf flag or the TREEHOUSE_UNIQUE_LEAF
+# env var (precedence: --unique-leaf > TREEHOUSE_UNIQUE_LEAF > this file
+# > user config > off).
+# unique_leaf = true
+# Optional worktree path: where a NEWLY created pool slot is placed.
+# Unset (default) uses {pool}/{slot}/{repo}, unchanged from before.
+# Placeholders: {pool} (this repository's pool directory), {slot} (the slot
+# name, required), {repo} (the repository directory name), {repo_parent}
+# (the directory holding the repository). One of {pool} or {repo} is
+# required too: slot names are per pool, so a user-level template without one
+# sends slot 1 of every repository to one directory. {repo_parent} does not
+# count - two repositories side by side expand it identically - so pair it,
+# as in the example below.
+# $VAR and ${VAR} expand first, before the placeholders are read.
+# The template must resolve to an absolute path, so anchor it on {pool},
+# {repo_parent}, or an absolute prefix of your own.
+# The path must not be inside the repository, must not contain the pool
+# directory, and inside the pool must stay at {pool}/{slot}/<name>.
+# A templated path that already exists is never adopted; get skips that slot
+# name and tries the next one, and fails only when every candidate is occupied.
+# This supersedes unique_leaf above: the template names every segment of the
+# path, including the leaf, so write {repo}-{slot} for a unique leaf. Setting
+# both warns once rather than silently picking one.
+# Worktrees already in the pool keep their recorded paths; nothing is moved.
+# Override per-command with the --worktree-path flag or the
+# TREEHOUSE_WORKTREE_PATH env var (precedence: --worktree-path >
+# TREEHOUSE_WORKTREE_PATH > this file > user config > default).
+# worktree_path = "{repo_parent}/{repo}-{slot}"
+
+# Optional tracked-file sharing: "off" (default) or "fresh".
+# See README: APFS copy-on-write sharing for safety requirements and precedence.
+# apfs_sharing = "fresh"
+
+# Version-control backend selection. Git is the default everywhere. Set
+# "jj" to opt in to the experimental Jujutsu backend for this repository
+# (or per-command with TREEHOUSE_VCS=jj). Pooled jj workspaces inherit this
+# opt-in from the main repository root.
+# vcs = "jj"
+
+# Lifecycle hooks do NOT belong in this file. A [hooks] section here is
+# ignored for safety, so that running treehouse in an untrusted clone cannot
+# execute checked-in shell. Treehouse warns on stderr when it ignores hook keys.
+# Put post_create and pre_destroy in ~/.config/treehouse/config.toml instead;
+# see the Hooks section of the README for the syntax.
