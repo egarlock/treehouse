@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -622,6 +624,96 @@ func TestApplyE2E(t *testing.T) {
 	}
 }
 
+func TestAtomicReplaceRunningWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows running-image replacement")
+	}
+
+	dir := t.TempDir()
+	targetPath := filepath.Join(dir, "hold.exe")
+	holdSrc := filepath.Join("testdata", "holdopen", "main.go")
+	build := exec.Command("go", "build", "-o", targetPath, holdSrc)
+	out, err := build.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go build holdopen: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(targetPath)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start holdopen: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	newBinaryPath := filepath.Join(dir, "new.bin")
+	newContent := []byte("replacement-bytes")
+	if err := os.WriteFile(newBinaryPath, newContent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := atomicReplace(targetPath, newBinaryPath); err != nil {
+		t.Fatalf("atomicReplace running windows exe: %v", err)
+	}
+
+	got, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(newContent) {
+		t.Errorf("replaced = %q, want %q", string(got), string(newContent))
+	}
+}
+
+func TestReplaceRunningWindowsStaleOld(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows running-image replacement")
+	}
+
+	dir := t.TempDir()
+	targetPath := filepath.Join(dir, "hold.exe")
+	staleOld := targetPath + ".old"
+	holdSrc := filepath.Join("testdata", "holdopen", "main.go")
+	build := exec.Command("go", "build", "-o", staleOld, holdSrc)
+	out, err := build.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go build holdopen: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(staleOld)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start leftover .old: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	if err := os.WriteFile(targetPath, []byte("current-bytes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tmpPath := filepath.Join(dir, "new.bin")
+	newContent := []byte("replacement-bytes")
+	if err := os.WriteFile(tmpPath, newContent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := replaceRunningWindows(targetPath, tmpPath); err != nil {
+		t.Fatalf("replaceRunningWindows with mapped leftover .old: %v", err)
+	}
+
+	got, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(newContent) {
+		t.Errorf("replaced = %q, want %q", string(got), string(newContent))
+	}
+}
+
 func TestRequireHTTPS(t *testing.T) {
 	if err := requireHTTPS("https://example.com/file"); err != nil {
 		t.Errorf("expected no error for HTTPS URL, got: %v", err)
@@ -666,4 +758,263 @@ func TestVerifyChecksumNoURL(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when checksum URL is empty")
 	}
+}
+
+// The update-check child outlives the command that spawned it. Inheriting the
+// caller's directory made it a process whose cwd sat inside whatever pooled
+// worktree treehouse was invoked from, so treehouse reported a process of its
+// own making as a tenant of that slot.
+func TestBackgroundCheckCommandRunsOutsideTheCallersDirectory(t *testing.T) {
+	caller := t.TempDir()
+	t.Chdir(caller)
+
+	cmd := backgroundCheckCommand("/usr/local/bin/treehouse", "v1.0.0")
+
+	if cmd.Dir == "" {
+		t.Fatal("expected the update-check child to be given a working directory of its own")
+	}
+	rel, err := filepath.Rel(cmd.Dir, caller)
+	if err == nil && rel == "." {
+		t.Fatalf("expected a directory outside the caller's, got %q", cmd.Dir)
+	}
+	if info, err := os.Stat(cmd.Dir); err != nil || !info.IsDir() {
+		t.Fatalf("expected %q to be an existing directory: %v", cmd.Dir, err)
+	}
+}
+
+// setTempDir points every variable os.TempDir consults on any supported
+// platform at dir.
+func setTempDir(t *testing.T, dir string) {
+	t.Helper()
+	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(name, dir)
+	}
+}
+
+func resolved(t *testing.T, path string) string {
+	t.Helper()
+	out, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func isInsideTree(t *testing.T, dir, root string) bool {
+	t.Helper()
+	rel, err := filepath.Rel(resolved(t, root), resolved(t, dir))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+// markWorktree turns dir into something the updater recognises as a worktree
+// root: a .git pointer file, as a pooled git slot carries.
+func markWorktree(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: /nowhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mkdirs(t *testing.T, dirs ...string) {
+	t.Helper()
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A caller standing in no worktree takes the temp directory as-is.
+func TestDetachedWorkingDirAcceptsATempDirOutsideAnyWorktree(t *testing.T) {
+	base := t.TempDir()
+	caller := filepath.Join(base, "caller")
+	tmp := filepath.Join(base, "tmp")
+	mkdirs(t, caller, tmp)
+	t.Chdir(caller)
+	setTempDir(t, tmp)
+
+	if got := detachedWorkingDir(); resolved(t, got) != resolved(t, tmp) {
+		t.Fatalf("expected the temp directory %q, got %q", tmp, got)
+	}
+}
+
+// A temp directory outside the worktree the caller stands in is accepted even
+// when the caller is deep inside that worktree.
+func TestDetachedWorkingDirAcceptsATempDirOutsideTheEnclosingWorktree(t *testing.T) {
+	base := t.TempDir()
+	slot := filepath.Join(base, "slot")
+	caller := filepath.Join(slot, "src", "pkg")
+	tmp := filepath.Join(base, "tmp")
+	mkdirs(t, caller, tmp)
+	markWorktree(t, slot)
+	t.Chdir(caller)
+	setTempDir(t, tmp)
+
+	if got := detachedWorkingDir(); resolved(t, got) != resolved(t, tmp) {
+		t.Fatalf("expected the temp directory %q, got %q", tmp, got)
+	}
+}
+
+// TMPDIR=$PWD/.tmp while standing at the root of a pooled worktree would hand
+// the detached child a cwd inside the very slot it was detached from. The temp
+// directory is rejected and the child runs somewhere the slot cannot contain.
+func TestDetachedWorkingDirRejectsATempDirBeneathTheCaller(t *testing.T) {
+	slot := t.TempDir()
+	tmp := filepath.Join(slot, ".tmp")
+	mkdirs(t, tmp)
+	markWorktree(t, slot)
+	t.Chdir(slot)
+	setTempDir(t, tmp)
+
+	assertOutsideWorktree(t, detachedWorkingDir(), slot)
+}
+
+// From <slot>/src with TMPDIR=<slot>/.tmp the temp directory is a sibling of
+// the caller's directory, not beneath it, yet still inside the slot. The
+// boundary is the enclosing worktree, so it is rejected all the same.
+func TestDetachedWorkingDirRejectsATempDirBesideTheCallerInsideTheWorktree(t *testing.T) {
+	slot := t.TempDir()
+	caller := filepath.Join(slot, "src")
+	tmp := filepath.Join(slot, ".tmp")
+	mkdirs(t, caller, tmp)
+	markWorktree(t, slot)
+	t.Chdir(caller)
+	setTempDir(t, tmp)
+
+	assertOutsideWorktree(t, detachedWorkingDir(), slot)
+}
+
+// The worktree root itself is inside the worktree.
+func TestDetachedWorkingDirRejectsTheWorktreeRootAsTempDir(t *testing.T) {
+	slot := t.TempDir()
+	caller := filepath.Join(slot, "src")
+	mkdirs(t, caller)
+	markWorktree(t, slot)
+	t.Chdir(caller)
+	setTempDir(t, slot)
+
+	assertOutsideWorktree(t, detachedWorkingDir(), slot)
+}
+
+// A symlink outside the worktree that resolves into it is still inside.
+func TestDetachedWorkingDirResolvesASymlinkedTempDir(t *testing.T) {
+	base := t.TempDir()
+	slot := filepath.Join(base, "slot")
+	caller := filepath.Join(slot, "src")
+	inside := filepath.Join(slot, ".tmp")
+	mkdirs(t, caller, inside)
+	markWorktree(t, slot)
+	link := filepath.Join(base, "tmp-link")
+	if err := os.Symlink(inside, link); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	t.Chdir(caller)
+	setTempDir(t, link)
+
+	assertOutsideWorktree(t, detachedWorkingDir(), slot)
+}
+
+// A caller reached through a symlink into a worktree is still inside it.
+func TestDetachedWorkingDirResolvesASymlinkedCaller(t *testing.T) {
+	base := t.TempDir()
+	slot := filepath.Join(base, "slot")
+	tmp := filepath.Join(slot, ".tmp")
+	mkdirs(t, filepath.Join(slot, "src"), tmp)
+	markWorktree(t, slot)
+	link := filepath.Join(base, "slot-link")
+	if err := os.Symlink(slot, link); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	t.Chdir(filepath.Join(link, "src"))
+	setTempDir(t, tmp)
+
+	assertOutsideWorktree(t, detachedWorkingDir(), slot)
+}
+
+func assertOutsideWorktree(t *testing.T, got, slot string) {
+	t.Helper()
+	if got == "" {
+		t.Fatal("expected a working directory of the child's own, got an inheriting empty Dir")
+	}
+	if isInsideTree(t, got, slot) {
+		t.Fatalf("expected a directory outside the worktree %q, got %q", slot, got)
+	}
+	if info, err := os.Stat(got); err != nil || !info.IsDir() {
+		t.Fatalf("expected %q to be an existing directory: %v", got, err)
+	}
+}
+
+// The child must still be told not to spawn a check of its own.
+func TestBackgroundCheckCommandSuppressesRecursiveChecks(t *testing.T) {
+	cmd := backgroundCheckCommand("/usr/local/bin/treehouse", "v1.0.0")
+
+	var found bool
+	for _, kv := range cmd.Env {
+		if kv == "TREEHOUSE_NO_UPDATE_CHECK=1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected TREEHOUSE_NO_UPDATE_CHECK=1 in the child environment")
+	}
+}
+
+func TestInNixStore(t *testing.T) {
+	store := resolved(t, t.TempDir())
+	outside := resolved(t, t.TempDir())
+	prev := nixStoreDir
+	nixStoreDir = store
+	t.Cleanup(func() { nixStoreDir = prev })
+
+	binary := filepath.Join(store, "abc123-treehouse-3.1.2", "bin", "treehouse")
+	mkdirs(t, filepath.Dir(binary))
+	if err := os.WriteFile(binary, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outsideBinary := filepath.Join(outside, "treehouse")
+	if err := os.WriteFile(outsideBinary, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"binary in the store", binary, true},
+		{"binary outside the store", outsideBinary, false},
+		{"the store root itself", store, false},
+		{"sibling sharing the store prefix", store + "-other/bin/treehouse", false},
+		{"missing path under the store", filepath.Join(store, "gone", "bin", "treehouse"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := InNixStore(tt.path); got != tt.want {
+				t.Fatalf("InNixStore(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+
+	t.Run("symlink resolving into the store", func(t *testing.T) {
+		link := filepath.Join(outside, "treehouse-link")
+		if err := os.Symlink(binary, link); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if !InNixStore(link) {
+			t.Fatalf("InNixStore(%q) = false, want true for a symlink into the store", link)
+		}
+	})
+
+	t.Run("symlink from the store to outside", func(t *testing.T) {
+		link := filepath.Join(store, "profile-link")
+		if err := os.Symlink(outsideBinary, link); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if InNixStore(link) {
+			t.Fatalf("InNixStore(%q) = true, want false for a link that resolves outside the store", link)
+		}
+	})
 }

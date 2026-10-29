@@ -1,15 +1,21 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # No x86_64-darwin: nixpkgs-unstable dropped it in 26.11 and throws on
+    # evaluation.
+    flake-compat.url = "github:edolstra/flake-compat";
+    flake-compat.flake = false;
   };
 
   outputs =
-    { nixpkgs, ... }:
+    { self
+    , nixpkgs
+    , ...
+    }:
     let
-      version = "2.0.0"; # x-release-please-version
+      version = "3.1.7"; # x-release-please-version
       systems = [
         "aarch64-darwin"
-        "x86_64-darwin"
         "aarch64-linux"
         "x86_64-linux"
       ];
@@ -20,17 +26,26 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          treehouse = pkgs.callPackage ./package.nix { inherit version; };
         in
         {
-          default = pkgs.buildGoModule {
-            pname = "treehouse";
-            inherit version;
-            src = ./.;
-            vendorHash = "sha256-fH93/19rZY/jduF4ZS0RLrqBWdCjz6XYnoN+3KPd4Lg=";
-            ldflags = [
-              "-X main.version=v${version}"
-            ];
-            nativeCheckInputs = [ pkgs.git ];
+          default = treehouse;
+          inherit treehouse;
+        }
+      );
+
+      apps = forAllSystems (
+        system:
+        {
+          default = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/${self.packages.${system}.default.meta.mainProgram}";
+            meta = self.packages.${system}.default.meta;
+          };
+          treehouse = {
+            type = "app";
+            program = "${self.packages.${system}.treehouse}/bin/${self.packages.${system}.treehouse.meta.mainProgram}";
+            meta = self.packages.${system}.treehouse.meta;
           };
         }
       );

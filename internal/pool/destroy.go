@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/kunchenguid/treehouse/internal/git"
-	"github.com/kunchenguid/treehouse/internal/hooks"
-	"github.com/kunchenguid/treehouse/internal/process"
+	"github.com/kunchenguid/treehouse/v3/internal/hooks"
+	"github.com/kunchenguid/treehouse/v3/internal/process"
+	"github.com/kunchenguid/treehouse/v3/internal/vcs"
 )
 
 // DestroyClass is the safety classification of a worktree considered for
@@ -52,6 +52,13 @@ const destroyGracePeriod = 2 * time.Second
 var findProcessesInWorktree = process.FindProcessesInWorktree
 var terminateWorktreeProcesses = process.TerminateWorktreeProcesses
 
+// dropProtectedProcesses removes the caller and its ancestors from a scanned
+// list, leaving the set `return` would terminate. List filters with it so
+// status and return agree on what is attached to a slot, and applies it to the
+// scan it already ran so a failed process-table read stays distinguishable
+// from a failed ancestry walk.
+var dropProtectedProcesses = process.DropProtectedProcesses
+
 type destroyReservation struct {
 	worktree               WorktreeEntry
 	originalOwnerPID       int32
@@ -70,6 +77,13 @@ type DestroyTarget struct {
 	// leased and dirty, for example, and then requires every corresponding flag.
 	Classes   []DestroyClass
 	Processes []process.ProcessInfo
+	// Flavor is the backend the worktree's own marker identifies ("git" or
+	// "jj"), independent of what the repository currently selects.
+	Flavor string
+	// OtherFlavor marks a worktree whose flavor differs from the backend the
+	// repository currently selects; destroying it is the documented pool
+	// migration.
+	OtherFlavor bool
 	// Detail is an honest, user-facing diagnostic for non-disposable targets
 	// (e.g. "HEAD not merged into origin/main" or "held by secondmate").
 	Detail string
@@ -122,6 +136,8 @@ type DestroyOptions struct {
 	IncludeLeased bool
 	// PreDestroy is the hook command list to run before deleting each worktree.
 	PreDestroy []string
+	// InspectTargets observes the locked target snapshot used by bulk destroy.
+	InspectTargets func([]WorktreeEntry)
 }
 
 // DestroyWorktree plans or removes a single named managed worktree. Because the
@@ -134,7 +150,10 @@ func DestroyWorktree(poolDir, worktreePath string, opts DestroyOptions) (Destroy
 		if err != nil {
 			return err
 		}
-		state = healState(state)
+		state, err = healState(poolDir, state)
+		if err != nil {
+			return err
+		}
 		if err := WriteState(poolDir, state); err != nil {
 			return err
 		}
@@ -167,11 +186,17 @@ func DestroyPool(poolDir string, opts DestroyOptions) (DestroyResult, error) {
 		if err != nil {
 			return err
 		}
-		state = healState(state)
+		state, err = healState(poolDir, state)
+		if err != nil {
+			return err
+		}
 		if err := WriteState(poolDir, state); err != nil {
 			return err
 		}
 		targets = append([]WorktreeEntry(nil), state.Worktrees...)
+		if opts.InspectTargets != nil {
+			opts.InspectTargets(append([]WorktreeEntry(nil), targets...))
+		}
 		return nil
 	}); err != nil {
 		return DestroyResult{}, err
@@ -181,22 +206,16 @@ func DestroyPool(poolDir string, opts DestroyOptions) (DestroyResult, error) {
 }
 
 func planAndDestroy(poolDir string, targets []WorktreeEntry, allowLeased bool, opts DestroyOptions) (DestroyResult, error) {
-	repoRoot := resolvePoolRepoRoot(targets)
-	defaultRef := ""
-	if repoRoot != "" {
-		// Resolve the merge target the same way prune does, so destroy and prune
-		// agree on what "unmerged" means. A failure leaves defaultRef empty, which
-		// classifyForDestroy reports as unverified rather than disposable.
-		if ref, err := resolvePruneDefaultRef(repoRoot); err == nil {
-			defaultRef = ref
-		}
-	}
+	resolveContext := worktreePruneContextResolver()
 
 	var result DestroyResult
 	var removable []DestroyTarget
 	for _, wt := range targets {
-		target := classifyForDestroy(wt, defaultRef)
-		measureDestroySize(&target)
+		// A resolution failure leaves the default ref empty, which
+		// classifyForDestroy reports as unverified rather than disposable.
+		context := resolveDestroyContext(resolveContext, wt)
+		target := classifyForDestroy(wt, context.RepoRoot, context.DefaultRef)
+		measureDestroySize(poolDir, &target)
 		ok, skip := opts.allows(target, allowLeased)
 		if ok {
 			removable = append(removable, target)
@@ -215,7 +234,7 @@ func planAndDestroy(poolDir string, targets []WorktreeEntry, allowLeased bool, o
 		return result, nil
 	}
 
-	destroyed, execSkips, err := executeDestroy(poolDir, removable, repoRoot, defaultRef, allowLeased, opts)
+	destroyed, execSkips, err := executeDestroy(poolDir, removable, resolveContext, allowLeased, opts)
 	if err != nil {
 		return DestroyResult{}, err
 	}
@@ -225,6 +244,17 @@ func planAndDestroy(poolDir string, targets []WorktreeEntry, allowLeased bool, o
 	}
 	result.Skipped = append(result.Skipped, execSkips...)
 	return result, nil
+}
+
+// resolveDestroyContext keeps markerless slots out of the configured-backend
+// fallback, which could otherwise resolve and fetch a repository enclosing the
+// pool. An empty context keeps the damaged slot unverified.
+func resolveDestroyContext(resolveContext pruneContextResolver, wt WorktreeEntry) pruneContext {
+	if vcs.WorktreeBackendName(wt.Path) == "" {
+		return pruneContext{}
+	}
+	context, _ := resolveContext(wt)
+	return context
 }
 
 // allows reports whether opts authorize removing target, returning a populated
@@ -258,10 +288,14 @@ func (opts DestroyOptions) missingFlags(target DestroyTarget, allowLeased bool) 
 
 // classifyForDestroy determines a managed worktree's destroy class using the
 // same safety primitives prune relies on (ownerAlive,
-// process.FindProcessesInWorktree, backingRepositoryMissing, git.IsDirty,
-// git.IsHeadMergedIntoRef against the ref from resolvePruneDefaultRef).
-func classifyForDestroy(wt WorktreeEntry, defaultRef string) DestroyTarget {
-	target := DestroyTarget{Name: wt.Name, Path: wt.Path}
+// process.FindProcessesInWorktree, backingRepositoryMissing, vcs.IsDirty,
+// vcs.IsHeadMergedIntoRef against the ref from resolvePruneDefaultRef, then
+// headLandedOnItsBase against the base the slot was cut from).
+func classifyForDestroy(wt WorktreeEntry, repoRoot, defaultRef string) DestroyTarget {
+	target := DestroyTarget{Name: wt.Name, Path: wt.Path, Flavor: vcs.WorktreeBackendName(wt.Path)}
+	if target.Flavor != "" && repoRoot != "" && target.Flavor != vcs.BackendNameFor(repoRoot) {
+		target.OtherFlavor = true
+	}
 
 	if wt.Leased {
 		detail := ""
@@ -280,12 +314,21 @@ func classifyForDestroy(wt WorktreeEntry, defaultRef string) DestroyTarget {
 		target.addClass(DestroyInUse, "cannot check processes: "+procErr.Error())
 	}
 
+	// A markerless slot (its .git/.jj marker is gone) must never have its
+	// facts read through the configured-backend fallback: in an in-project
+	// pool that resolves the repository ENCLOSING the pool, and a clean
+	// enclosing repository would label the damaged slot disposable.
+	if target.Flavor == "" {
+		target.addClass(DestroyUnverified, "no .git or .jj marker: contents cannot be verified")
+		return finalizeDestroyTarget(target)
+	}
+
 	if orphaned, detail := backingRepositoryMissing(wt.Path); orphaned {
 		target.addClass(DestroyUnverified, "backing repository missing: "+detail)
 		return finalizeDestroyTarget(target)
 	}
 
-	dirty, err := git.IsDirty(wt.Path)
+	dirty, err := vcs.IsDirty(wt.Path)
 	if err != nil {
 		target.addClass(DestroyUnverified, "cannot check status: "+err.Error())
 		return finalizeDestroyTarget(target)
@@ -297,13 +340,18 @@ func classifyForDestroy(wt WorktreeEntry, defaultRef string) DestroyTarget {
 		target.addClass(DestroyUnverified, "cannot verify HEAD is merged into the default branch")
 		return finalizeDestroyTarget(target)
 	}
-	merged, err := git.IsHeadMergedIntoRef(wt.Path, defaultRef)
+	ref, err := mergeRefForWorktree(wt.Path, pruneContext{RepoRoot: repoRoot, DefaultRef: defaultRef})
 	if err != nil {
-		target.addClass(DestroyUnverified, "cannot verify merge into "+defaultRef+": "+err.Error())
+		target.addClass(DestroyUnverified, "cannot resolve the default branch in this worktree's "+target.Flavor+" backend: "+err.Error())
 		return finalizeDestroyTarget(target)
 	}
-	if !merged {
-		target.addClass(DestroyUnmerged, "HEAD not merged into "+defaultRef)
+	merged, err := vcs.IsHeadMergedIntoRef(wt.Path, ref)
+	if err != nil {
+		target.addClass(DestroyUnverified, "cannot verify merge into "+ref+": "+err.Error())
+		return finalizeDestroyTarget(target)
+	}
+	if !merged && !headLandedOnItsBase(wt.Path, wt.BaseBranch) {
+		target.addClass(DestroyUnmerged, "HEAD not merged into "+ref)
 	}
 
 	return finalizeDestroyTarget(target)
@@ -347,7 +395,7 @@ func (target DestroyTarget) hasUnlandedClass() bool {
 // under the state lock, runs pre-destroy hooks with the lock released, then
 // removes only the worktrees whose reservation is still intact. A worktree
 // re-acquired during its hook (its reservation superseded) is left in place.
-func executeDestroy(poolDir string, removable []DestroyTarget, repoRoot, defaultRef string, allowLeased bool, opts DestroyOptions) ([]DestroyTarget, []DestroySkip, error) {
+func executeDestroy(poolDir string, removable []DestroyTarget, resolveContext pruneContextResolver, allowLeased bool, opts DestroyOptions) ([]DestroyTarget, []DestroySkip, error) {
 	if len(removable) == 0 {
 		return nil, nil, nil
 	}
@@ -364,12 +412,16 @@ func executeDestroy(poolDir string, removable []DestroyTarget, repoRoot, default
 		if err != nil {
 			return err
 		}
-		state = healState(state)
+		state, err = healState(poolDir, state)
+		if err != nil {
+			return err
+		}
 		for i := range state.Worktrees {
 			if _, ok := plannedByPath[state.Worktrees[i].Path]; !ok {
 				continue
 			}
-			current := classifyForDestroy(state.Worktrees[i], defaultRef)
+			context := resolveDestroyContext(resolveContext, state.Worktrees[i])
+			current := classifyForDestroy(state.Worktrees[i], context.RepoRoot, context.DefaultRef)
 			if planned, ok := plannedByPath[current.Path]; ok && current.Bytes == 0 {
 				current.Bytes = planned.Bytes
 			}
@@ -429,8 +481,9 @@ func executeDestroy(poolDir string, removable []DestroyTarget, repoRoot, default
 			path := state.Worktrees[idx].Path
 			currentEntry := state.Worktrees[idx]
 			restoreOriginalOwnerReservation(&currentEntry, reservation)
-			current := classifyForDestroy(currentEntry, defaultRef)
-			measureDestroySize(&current)
+			context := resolveDestroyContext(resolveContext, currentEntry)
+			current := classifyForDestroy(currentEntry, context.RepoRoot, context.DefaultRef)
+			measureDestroySize(poolDir, &current)
 			if planned, ok := plannedByPath[path]; ok && current.Bytes == 0 {
 				current.Bytes = planned.Bytes
 			}
@@ -464,7 +517,7 @@ func executeDestroy(poolDir string, removable []DestroyTarget, repoRoot, default
 				}
 			}
 
-			if err := removeManagedWorktree(repoRoot, path); err != nil {
+			if err := removeManagedWorktree(poolDir, currentEntry); err != nil {
 				restoreOriginalOwnerReservation(&state.Worktrees[idx], reservation)
 				current.Detail = err.Error()
 				skips = append(skips, DestroySkip{Target: current})
@@ -511,51 +564,63 @@ func restoreOriginalOwnerReservation(wt *WorktreeEntry, reservation destroyReser
 }
 
 // removeManagedWorktree deletes a worktree's git registration (when its backing
-// repository is still present) and its numbered container directory. git removal
-// uses --force because destroy deliberately removes dirty, unmerged, or
-// unverified worktrees once the caller has opted in.
-func removeManagedWorktree(repoRoot, path string) error {
+// repository is still present) and the directory removableWorktreeContainer
+// selects: its numbered slot directory inside the pool, or just the worktree
+// when worktree_path placed it elsewhere. git removal uses --force because
+// destroy deliberately removes dirty, unmerged, or unverified worktrees once the
+// caller has opted in.
+func removeManagedWorktree(poolDir string, wt WorktreeEntry) error {
+	path := wt.Path
 	orphaned, _ := backingRepositoryMissing(path)
+	// A markerless slot (directory present, .git/.jj marker gone) has no live
+	// VCS registration either backend will deregister - git refuses to remove
+	// a worktree whose .git file is missing - so it takes the plain-directory
+	// route. The stale registration self-heals when a later add targets the
+	// same path: git via `git worktree add --force`, jj by forgetting the
+	// stale same-path workspace registration.
+	markerless := false
 	if !orphaned {
-		removeRepoRoot := repoRoot
-		if removeRepoRoot == "" {
-			resolvedRoot, err := git.FindMainRepoRootFrom(path)
-			if err != nil {
-				return fmt.Errorf("cannot resolve repository for worktree removal: %w", err)
-			}
-			removeRepoRoot = resolvedRoot
-		}
-		if err := git.RemoveWorktree(removeRepoRoot, path); err != nil {
-			return fmt.Errorf("git refused to remove worktree: %w", err)
+		if _, err := os.Stat(path); err == nil {
+			markerless = vcs.WorktreeBackendName(path) == ""
 		}
 	}
-	container, err := removableWorktreeContainer(path)
+	if !orphaned && !markerless {
+		removeRepoRoot, err := resolvePoolRepoRoot(wt)
+		if err != nil {
+			return fmt.Errorf("cannot resolve repository for worktree removal: %w", err)
+		}
+		if err := vcs.RemoveWorktree(removeRepoRoot, path); err != nil {
+			return fmt.Errorf("VCS refused to remove worktree: %w", err)
+		}
+	}
+	container, err := removableWorktreeContainer(poolDir, path)
 	if err != nil {
 		return fmt.Errorf("refusing unsafe cleanup path: %w", err)
 	}
 	if err := os.RemoveAll(container); err != nil {
 		return fmt.Errorf("could not remove worktree directory: %w", err)
 	}
+	if orphaned || markerless {
+		// Neither route called vcs.RemoveWorktree, so nothing has dropped the
+		// worktree's jj seed authentication.
+		dropStaleJJSeedAuthentication(poolDir, wt)
+	}
 	return nil
 }
 
-// resolvePoolRepoRoot derives the owning repository from the first target whose
-// backing repository is still present. A pool is per-repository, so one root
-// applies to every worktree in it.
-func resolvePoolRepoRoot(targets []WorktreeEntry) string {
-	for _, wt := range targets {
-		if orphaned, _ := backingRepositoryMissing(wt.Path); orphaned {
-			continue
-		}
-		if root, err := git.FindMainRepoRootFrom(wt.Path); err == nil {
-			return root
-		}
+// resolvePoolRepoRoot derives one worktree's owning repository from its path.
+// A pool may be shared by multiple clones, so callers must resolve every slot
+// independently and must not apply one slot's root to another.
+func resolvePoolRepoRoot(wt WorktreeEntry) (string, error) {
+	root, err := vcs.FindMainRepoRootFrom(wt.Path)
+	if err != nil {
+		return "", fmt.Errorf("resolve repository for worktree %s: %w", wt.Path, err)
 	}
-	return ""
+	return root, nil
 }
 
-func measureDestroySize(target *DestroyTarget) {
-	container, err := removableWorktreeContainer(target.Path)
+func measureDestroySize(poolDir string, target *DestroyTarget) {
+	container, err := removableWorktreeContainer(poolDir, target.Path)
 	if err != nil {
 		return
 	}

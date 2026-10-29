@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kunchenguid/treehouse/v3/internal/vcs"
 )
 
 const (
@@ -31,6 +33,10 @@ const (
 	maxAPIResponseSize  = 5 << 20   // 5 MB
 	treehouseDir        = ".treehouse"
 )
+
+// nixStoreDir is the Nix store root. It is a variable so tests can point it at a
+// temporary directory.
+var nixStoreDir = "/nix/store"
 
 // githubAPIURL is the endpoint for fetching the latest release.
 // Overridden in tests to point at a local HTTP server.
@@ -64,6 +70,23 @@ type githubRelease struct {
 type githubAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
+// InNixStore reports whether path, after symlink resolution, lies inside the
+// Nix store. A path that cannot be resolved is judged as given.
+func InNixStore(path string) bool {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	rel, err := filepath.Rel(nixStoreDir, path)
+	return err == nil && rel != "." && filepath.IsLocal(rel)
+}
+
+// RunningFromNixStore reports whether the running executable lives in the Nix
+// store, where it can only be upgraded through Nix.
+func RunningFromNixStore() bool {
+	exe, err := os.Executable()
+	return err == nil && InNixStore(exe)
 }
 
 // CheckLatest hits the GitHub API, compares versions, and writes the cache.
@@ -175,11 +198,7 @@ func SpawnBackgroundCheck(currentVersion string) error {
 		return fmt.Errorf("resolving symlinks: %w", err)
 	}
 
-	cmd := exec.Command(self, "--update-check", currentVersion)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.Stdin = nil
-	cmd.Env = append(os.Environ(), "TREEHOUSE_NO_UPDATE_CHECK=1")
+	cmd := backgroundCheckCommand(self, currentVersion)
 
 	devNull, err := os.Open(os.DevNull)
 	if err == nil {
@@ -200,6 +219,109 @@ func SpawnBackgroundCheck(currentVersion string) error {
 	}()
 
 	return nil
+}
+
+// backgroundCheckCommand builds the detached update-check child. It runs from
+// a directory of its own rather than inheriting the caller's: the child
+// outlives the command that spawned it, and a cwd inside a pooled worktree
+// makes it a process attached to that slot - one treehouse itself created,
+// reported by status and targeted by return. Detaching the cwd also stops the
+// child from holding the caller's directory open after it exits.
+func backgroundCheckCommand(self, currentVersion string) *exec.Cmd {
+	cmd := exec.Command(self, "--update-check", currentVersion)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+	cmd.Env = append(os.Environ(), "TREEHOUSE_NO_UPDATE_CHECK=1")
+	cmd.Dir = detachedWorkingDir()
+	return cmd
+}
+
+// detachedWorkingDir returns a directory for a process that must not hold the
+// caller's. The temp directory is the first choice, but only when it lies
+// outside the worktree the caller is standing in: TMPDIR=<slot>/.tmp while
+// running from <slot>/src would put the child straight back inside the slot it
+// was detached from, and the boundary that matters is the slot, not the
+// caller's subdirectory of it. A caller outside any worktree takes the temp
+// directory as-is. The root of the caller's volume is the fallback, because no
+// worktree can contain it. An empty result inherits the caller's directory and
+// is kept only for when nothing usable can be determined at all: an update
+// check is worth less than a failed spawn.
+func detachedWorkingDir() string {
+	caller, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	if tmp := os.TempDir(); isDirectory(tmp) && outsideEnclosingWorktree(tmp, caller) {
+		return tmp
+	}
+	if root := filepath.VolumeName(caller) + string(filepath.Separator); isDirectory(root) {
+		return root
+	}
+	return ""
+}
+
+func isDirectory(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+// outsideEnclosingWorktree reports whether dir is safe for a child detached
+// from a caller standing in cwd: true when cwd lies in no worktree at all, or
+// when dir is neither the enclosing worktree root nor a descendant of it.
+// Symlinks are resolved on both sides so a symlinked temp path cannot slip
+// inside, and anything that cannot be resolved or walked fails closed.
+func outsideEnclosingWorktree(dir, cwd string) bool {
+	resolvedCwd, err := resolveAbs(cwd)
+	if err != nil {
+		return false
+	}
+	root, err := enclosingWorktreeRoot(resolvedCwd)
+	if err != nil {
+		return false
+	}
+	if root == "" {
+		return true
+	}
+	resolvedDir, err := resolveAbs(dir)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(root, resolvedDir)
+	if err != nil {
+		// No relative path exists only across volumes, which is outside.
+		return true
+	}
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// enclosingWorktreeRoot walks up from dir to the volume root and returns the
+// first directory carrying a worktree marker (a .git entry or a .jj directory,
+// the same pair the vcs package recognises on a pool slot), or "" when none
+// does. A marker that cannot be read is an error rather than a miss.
+func enclosingWorktreeRoot(dir string) (string, error) {
+	for {
+		name, err := vcs.WorktreeBackendNameChecked(dir)
+		if err != nil {
+			return "", err
+		}
+		if name != "" {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", nil
+		}
+		dir = parent
+	}
+}
+
+func resolveAbs(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(abs)
 }
 
 // RunBackgroundCheck is the entry point for the --update-check child process.
@@ -619,10 +741,35 @@ func atomicReplace(target, newBinary string) error {
 
 	// Atomic rename
 	if err := os.Rename(tmpPath, target); err != nil {
+		if runtime.GOOS == "windows" {
+			if werr := replaceRunningWindows(target, tmpPath); werr == nil {
+				return nil
+			}
+		}
 		os.Remove(tmpPath)
 		return err
 	}
 
+	return nil
+}
+
+// replaceRunningWindows moves a locked running image aside, then places the
+// new binary at the original path. Windows allows renaming a mapped .exe even
+// though overwriting it in place returns Access is denied.
+//
+// The backup name is unique per attempt. A prior update can leave target.old
+// mapped by a still-running process, so a fixed .old path cannot be removed
+// or reused as the next rename destination.
+func replaceRunningWindows(target, tmpPath string) error {
+	oldPath := fmt.Sprintf("%s.old.%d.%d", target, os.Getpid(), time.Now().UnixNano())
+	if err := os.Rename(target, oldPath); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, target); err != nil {
+		_ = os.Rename(oldPath, target)
+		return err
+	}
+	_ = os.Remove(oldPath)
 	return nil
 }
 
